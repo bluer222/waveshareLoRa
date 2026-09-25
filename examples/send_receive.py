@@ -7,7 +7,7 @@ script on each side with a different --port.
 import argparse
 import asyncio
 
-from waveshare_lora import LoRaDevice, LoraConfig
+from waveshare_lora import LoraConfig, LoRaDevice
 
 
 async def talk(port: str, channel: int, band: str) -> None:
@@ -19,9 +19,11 @@ async def talk(port: str, channel: int, band: str) -> None:
             print(f"[{port}] sent seq={i}")
             try:
                 data, meta = await dev.recv_json(timeout=8.0)
-                print(f"[{port}] got {data} "
-                      f"(seq={meta.seq} frags={meta.count} "
-                      f"compressed={meta.compressed} rssi={meta.rssi})")
+                print(
+                    f"[{port}] got {data} "
+                    f"(seq={meta.seq} frags={meta.count} "
+                    f"compressed={meta.compressed} rssi={meta.rssi})"
+                )
             except TimeoutError:
                 print(f"[{port}] no reply within 8s")
 

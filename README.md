@@ -3,8 +3,8 @@
 Async Python library for sending/receiving JSON over the
 [Waveshare USB-TO-LoRa-xF](https://www.waveshare.com/usb-to-lora.htm)
 ([wiki](https://www.waveshare.com/wiki/USB-TO-LoRa-xF), SX1262, 410–490 / 850–930 MHz).
-Full AT parameter coverage, `asyncio`-native serial, and a minimal-bytes
-`struct.pack` + `zlib` frame codec with auto-fragmentation.
+Full AT parameter coverage, `asyncio`-native serial, and a compact
+`struct.pack` + `zlib` message codec.
 
 ## Install
 
@@ -30,18 +30,20 @@ async def main():
 asyncio.run(main())
 ```
 
-Packet mode (per-message addressing, `AT+MODE=2`):
+Packet mode (`AT+MODE=2`) sends a destination prefix followed by one frame.
+The prefix and frame must fit within 240 bytes:
 
 ```python
 cfg = LoraConfig(mode=2, addr=0x0001, txch=18, rxch=18)
 async with LoRaDevice("/dev/ttyUSB0", config=cfg) as dev:
+    await dev.apply_config(cfg)  # set AT+MODE=2 on the radio
     await dev.send_json({"cmd": "on"}, dest_addr=0x0002, dest_channel=18)
 ```
 
 Configure every radio parameter at once:
 
 ```python
-await dev.apply_config(LoraConfig(sf=9, pwr=22, key=1234, lbt=True, rssi=True))
+await dev.apply_config(LoraConfig(sf=9, pwr=22, key=1234, lbt=True))
 live = await dev.read_config()   # AT+ALLP? round-trip
 ```
 
@@ -59,7 +61,7 @@ See `examples/configure.py` and `examples/send_receive.py`.
 | `lbt` | `AT+LBT` | 0/1 | listen-before-talk |
 | `mode` | `AT+MODE` | 1 stream / 2 packet / 3 relay | |
 | `txch`/`rxch` | `AT+TXCH`/`AT+RXCH` | 0–80 | freq = 410+CH (LF) or 850+CH (HF) |
-| `rssi` | `AT+RSSI` | 0/1 | 1-byte trailer on RX |
+| `rssi` | `AT+RSSI` | 0/1 | trailer per dongle output packet; library sends are limited to one RF packet when enabled |
 | `addr` | `AT+ADDR` | 0–65535 | 65535 = broadcast listen |
 | `port` | `AT+PORT` | 1 RS422 / 2 RS485 / 3 RS232 | kept for AllP compat on USB units |
 | `baud` | `AT+BAUD` | 1200…115200 | host port re-opens on change |
@@ -70,12 +72,16 @@ See `examples/configure.py` and `examples/send_receive.py`.
 Plus `+++` / `AT+EXIT` / `ATE` / `AT+VER` / `AT+HELP` / `AT+ALLP?` /
 `AT+AllP=…` / `AT+RESTORE=1`. `apply_config()` writes a single `AT+AllP`
 (15 fields) by default, exits (module reboots ≈3 s), and re-opens the host
-port if the baud changed. `+++` is sent in one write — char-by-char entry
+port if the baud or serial framing changed. `+++` is sent in one write — char-by-char entry
 is ignored by firmware.
+With `restore_first=True`, the library waits for the reset, re-opens the host
+port at the factory 115200/8N1 setting, then enters AT mode to apply the new
+configuration. The reset command's exact reply and reboot timing need a
+hardware check on the target firmware.
 
 ## Wire efficiency (codec)
 
-`codec.py` packs each message with precompiled `struct`:
+`codec.py` packs each application message with a precompiled `struct`:
 
 ```
 MAGIC 2B | VERFLAGS 1B | SEQ 2B | TOTAL 2B | IDX 1B | COUNT 1B | FRAG_LEN 2B | HDR_CRC 2B | CRC32 4B | payload
@@ -83,14 +89,33 @@ MAGIC 2B | VERFLAGS 1B | SEQ 2B | TOTAL 2B | IDX 1B | COUNT 1B | FRAG_LEN 2B | H
 
 * JSON dumped compactly (`orjson` when installed, else `separators=(",",":")`).
 * `zlib` (C) compression applied only when it shrinks; 1 flag bit records it.
-* Fragments sized to the 240 B air MTU (237 B in packet mode after the
-  `struct`-packed 3 B addr+channel prefix); header CRC16 rejects false
-  resync hits inside payload data, CRC32 guards reassembly;
-  `StreamDecoder` resyncs across split/merged serial reads with per-fragment
-  `struct.unpack_from` and `memoryview` (no per-byte Python loops).
-* Airtime-proportional pacing between fragments (`estimate_airtime_ms`).
+  The uncompressed message limit is 1 MiB on both encoding and decoding.
+* The encoder compresses each message once, then divides it into application
+  fragments no larger than 240 bytes including each 17-byte header.
+  `StreamDecoder` reassembles them across arbitrary serial reads. A truncated
+  fragment can delay later messages until its declared length is filled or
+  30 seconds pass without input; it cannot claim thousands of later bytes.
+  On EOF, the decoder scans past a truncated fragment to recover complete
+  frames. A complete frame deliberately embedded inside a truncated raw
+  payload is indistinguishable from a later frame and may also be delivered.
+* The sender writes one fragment at a time and waits for a rough airtime
+  estimate. Each write is at most 240 bytes, or less when `tx_chunk_size` is
+  smaller. Pacing is not a transmit-complete signal.
+* Packet mode sends one prefix and one frame in a single write. The library
+  rejects frames that exceed 237 bytes after the 3-byte prefix and requires
+  pacing between sends. Waveshare documents what the first three bytes of a
+  sent data stream mean, but not the UART idle time that separates streams.
+  Consecutive packet-mode sends still need a hardware test to confirm that
+  the dongle treats them as separate streams. To check this, alternate small
+  and 240-byte sends to two receiver addresses and verify both the destination
+  and decoded payload on each receiver.
+* When `AT+RSSI=1`, the library rejects outgoing messages needing more than
+  one fragment. Every peer must observe that limit.
+  RSSI bytes follow the dongle's RF packets, not application messages. This
+  mode also assumes the dongle emits one application frame per RF packet;
+  verify that on hardware, or leave RSSI disabled.
 
-Typical sensor JSON compresses 50–80 %; header overhead is 17 B/fragment.
+Typical sensor JSON compresses 50–80 %; each fragment has a 17-byte header.
 
 ## Layout
 
@@ -103,7 +128,9 @@ tests/test_lora.py                               # hardware-free, pytest-asyncio
 ## Hardware notes
 
 * Default pairing: stream mode, 115200 8N1, CH18 (HF 868 MHz) / CH23 (LF 433 MHz).
-* Single air packet ≤ 240 B; device auto-fragments above that with a 960 B cache.
+* Single RF packet ≤ 240 B; the dongle auto-packetizes larger streams and has
+  a fixed 960-byte cache. Library writes stay within the RF packet limit, but
+  the vendor does not document RF flush timing.
 * Relay mode (`AT+MODE=3`) forwards only — no serial output. Relay ADDR =
   `first_netid << 8 | second_netid` (`LoraConfig.relay_addr`).
 * `65535` (`0xFFFF`) is the broadcast/listen-all address.

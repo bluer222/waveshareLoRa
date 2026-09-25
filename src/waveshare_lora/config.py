@@ -17,14 +17,14 @@ kHz *value* (125/250/500). This class handles both.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from enum import IntEnum
 from typing import Any
-
 
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
+
 
 class BandwidthIndex(IntEnum):
     KHZ_125 = 0
@@ -36,7 +36,7 @@ class BandwidthIndex(IntEnum):
         return {0: 125, 1: 250, 2: 500}[int(self)]
 
     @classmethod
-    def from_khz(cls, khz: int) -> "BandwidthIndex":
+    def from_khz(cls, khz: int) -> BandwidthIndex:
         mapping = {125: cls.KHZ_125, 250: cls.KHZ_250, 500: cls.KHZ_500}
         try:
             return mapping[int(khz)]
@@ -58,7 +58,7 @@ class CodeRateIndex(IntEnum):
 class OperationMode(IntEnum):
     STREAM = 1  # transparent stream (e.g. Modbus ASCII / plain serial)
     PACKET = 2  # packet mode, 3-byte addr+channel prefix (e.g. Modbus RTU)
-    RELAY = 3   # relay node: forwards, no serial output
+    RELAY = 3  # relay node: forwards, no serial output
 
 
 class SerialPort(IntEnum):
@@ -71,7 +71,7 @@ class FrequencyBand(str):
     LF = "LF"  # 410..490 MHz  (410 + CH)
     HF = "HF"  # 850..930 MHz  (850 + CH)
 
-    def __new__(cls, value: str) -> "FrequencyBand":
+    def __new__(cls, value: str) -> "FrequencyBand":  # noqa: PYI034, UP037
         v = str(value).upper()
         if v not in ("LF", "HF"):
             raise ValueError(f"band must be 'LF' or 'HF', got {value!r}")
@@ -79,19 +79,19 @@ class FrequencyBand(str):
         return obj
 
 
-VALID_BAUDS = (1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200)
+VALID_BAUDS = (1200, 2400, 4800, 9600, 14400, 19200, 38400, 57600, 115200)
 COMM_RE = re.compile(r"^([89])([NOE])([012])$")
 
 BROADCAST_ADDR = 0xFFFF  # 65535: broadcast / listen-all
-MAX_AIR_SINGLE = 240     # max bytes per single LoRa packet (device auto-fragments above)
-CACHE_BYTES = 960        # device serial cache
+MAX_AIR_SINGLE = 240  # RF packet cap; the device packetizes longer serial streams
+CACHE_BYTES = 960  # documented device cache size
 
 
 def comm_to_pyserial(comm: str) -> dict[str, Any]:
     """Convert ``8N1``-style COMM string to pyserial kwargs.
 
     COMM format: ``<databits><parity><stop>`` e.g. ``8N1``.
-    databits: 8 or 9 (9 is mapped to 8 with a warning — pyserial has no 9-bit mode;
+    databits: 8 or 9 (9 is mapped to 8 because pyserial has no 9-bit mode;
       the DTU UART still accepts it, the USB CDC side negotiates 8).
     parity: N/O/E. stop: 0/1/2 (0 is treated as 1 on the host side).
     """
@@ -103,9 +103,16 @@ def comm_to_pyserial(comm: str) -> dict[str, Any]:
 
     return {
         "bytesize": serial.EIGHTBITS,  # 9-bit has no host equivalent; device handles it
-        "parity": {"N": serial.PARITY_NONE, "O": serial.PARITY_ODD, "E": serial.PARITY_EVEN}[parity],
-        "stopbits": {  # device '0' historically means 1 stop bit
-            "0": serial.STOPBITS_ONE, "1": serial.STOPBITS_ONE, "2": serial.STOPBITS_TWO,
+        "parity": {
+            "N": serial.PARITY_NONE,
+            "O": serial.PARITY_ODD,
+            "E": serial.PARITY_EVEN,
+        }[parity],
+        "stopbits": {
+            # Device value '0' historically means one stop bit.
+            "0": serial.STOPBITS_ONE,
+            "1": serial.STOPBITS_ONE,
+            "2": serial.STOPBITS_TWO,
         }[stop],
         "_device_databits": int(databits),
     }
@@ -115,25 +122,26 @@ def comm_to_pyserial(comm: str) -> dict[str, Any]:
 # Main config dataclass
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class LoraConfig:
     """Full device parameter set. Defaults = factory stream-mode pairing defaults."""
 
-    sf: int = 7            # 7..12
+    sf: int = 7  # 7..12
     bw: BandwidthIndex = field(default=BandwidthIndex.KHZ_125)
     cr: CodeRateIndex = field(default=CodeRateIndex.CR_4_5)
-    pwr: int = 22          # 10..22 dBm
-    netid: int = 0         # 0..65535 (early docs say 0..255; firmware accepts 0..65535)
-    lbt: bool = False      # listen-before-talk
+    pwr: int = 22  # 10..22 dBm
+    netid: int = 0  # 0..65535 (early docs say 0..255; firmware accepts 0..65535)
+    lbt: bool = False  # listen-before-talk
     mode: OperationMode = field(default=OperationMode.STREAM)
-    txch: int = 18         # 0..80
-    rxch: int = 18         # 0..80
-    rssi: bool = False     # append RSSI byte on RX output
-    addr: int = 0          # 0..65535, 65535 = broadcast listen
-    port: int = 3          # 1=RS422 2=RS485 3=RS232 (kept for AllP compat on USB units)
-    baud: int = 115200     # serial baud 1200..115200
-    comm: str = "8N1"      # serial framing
-    key: int = 0           # 0=disable AES, 1..65535 AES key
+    txch: int = 18  # 0..80
+    rxch: int = 18  # 0..80
+    rssi: bool = False  # append RSSI byte on RX output
+    addr: int = 0  # 0..65535, 65535 = broadcast listen
+    port: int = 3  # 1=RS422 2=RS485 3=RS232 (kept for AllP compat on USB units)
+    baud: int = 115200  # serial baud 1200..115200
+    comm: str = "8N1"  # serial framing
+    key: int = 0  # 0=disable AES, 1..65535 AES key
     band: FrequencyBand = field(default_factory=lambda: FrequencyBand("HF"))
 
     def __post_init__(self) -> None:
@@ -144,7 +152,9 @@ class LoraConfig:
                 v = int(self.bw)  # type: ignore[arg-type]
                 self.bw = BandwidthIndex(v) if v in (0, 1, 2) else BandwidthIndex.from_khz(v)
             except (ValueError, TypeError):
-                raise ValueError(f"bw must be BandwidthIndex, 0/1/2 or 125/250/500, got {self.bw!r}")
+                raise ValueError(
+                    f"bw must be BandwidthIndex, 0/1/2 or 125/250/500, got {self.bw!r}"
+                )
         if not isinstance(self.cr, CodeRateIndex):
             self.cr = CodeRateIndex(int(self.cr))  # type: ignore[arg-type]
         if not isinstance(self.mode, OperationMode):
@@ -177,8 +187,8 @@ class LoraConfig:
                 raise ValueError(f"{name} must be 0..80")
         if not 0 <= int(self.addr) <= 65535:
             raise ValueError("addr must be 0..65535")
-        if not 1 <= int(self.port) <= 255:
-            raise ValueError("port must be 1..255 (1=RS422,2=RS485,3=RS232)")
+        if int(self.port) not in (1, 2, 3):
+            raise ValueError("port must be 1, 2, or 3 (RS422, RS485, or RS232)")
         if int(self.baud) not in VALID_BAUDS:
             raise ValueError(f"baud must be one of {VALID_BAUDS}")
         if not COMM_RE.match(self.comm):
@@ -227,16 +237,16 @@ class LoraConfig:
         ]
 
     def to_allp(self) -> str:
-        """Bulk command: ``AT+AllP=sf,bw_khz,cr,pwr,netid,lbt,mode,txch,rxch,rssi,addr,port,baud,"COMM",key``."""
+        """Build the bulk command with fields in the device's documented order."""
         return (
             f"AT+AllP={int(self.sf)},{self.bw_khz},{int(self.cr)},{int(self.pwr)},"
             f"{int(self.netid)},{int(self.lbt)},{int(self.mode)},"
             f"{int(self.txch)},{int(self.rxch)},{int(self.rssi)},{int(self.addr)},"
-            f"{int(self.port)},{int(self.baud)},\"{self.comm}\",{int(self.key)}"
+            f'{int(self.port)},{int(self.baud)},"{self.comm}",{int(self.key)}'
         )
 
     @classmethod
-    def from_allp(cls, response: str, band: str = "HF") -> "LoraConfig":
+    def from_allp(cls, response: str, band: str = "HF") -> LoraConfig:
         """Parse ``AT+ALLP?`` reply or an AllP value list into a config.
 
         Accepts ``+AllP:7,125,1,22,...`` / ``7,125,1,22,...`` with optional quotes.
@@ -253,16 +263,29 @@ class LoraConfig:
         parts = [p.strip().strip('"').strip("'") for p in s.split(",")]
         if len(parts) != 15:
             raise ValueError(f"AllP needs 15 fields, got {len(parts)}: {response!r}")
-        (sf, bw_khz, cr, pwr, netid, lbt, mode, txch, rxch, rssi,
-         addr, port, baud, comm, key) = parts
+        (sf, bw_khz, cr, pwr, netid, lbt, mode, txch, rxch, rssi, addr, port, baud, comm, key) = (
+            parts
+        )
         return cls(
-            sf=int(sf), bw=BandwidthIndex.from_khz(int(bw_khz)), cr=int(cr),
-            pwr=int(pwr), netid=int(netid), lbt=bool(int(lbt)), mode=int(mode),
-            txch=int(txch), rxch=int(rxch), rssi=bool(int(rssi)), addr=int(addr),
-            port=int(port), baud=int(baud), comm=comm, key=int(key), band=band,
+            sf=int(sf),
+            bw=BandwidthIndex.from_khz(int(bw_khz)),
+            cr=int(cr),
+            pwr=int(pwr),
+            netid=int(netid),
+            lbt=bool(int(lbt)),
+            mode=int(mode),
+            txch=int(txch),
+            rxch=int(rxch),
+            rssi=bool(int(rssi)),
+            addr=int(addr),
+            port=int(port),
+            baud=int(baud),
+            comm=comm,
+            key=int(key),
+            band=band,
         )
 
-    def diff_commands(self, other: "LoraConfig") -> list[str]:
+    def diff_commands(self, other: LoraConfig) -> list[str]:
         """AT commands that differ from *other* (useful for minimal writes)."""
         mine = self.to_at_commands()
         theirs = set(other.to_at_commands())
@@ -287,28 +310,30 @@ class LoraConfig:
     def estimate_airtime_ms(self, payload_bytes: int) -> float:
         """Rough LoRa airtime estimate (Semtech formula, 8-symbol preamble, CRC on).
 
-        Good enough for inter-fragment pacing; not a substitute for a link budget tool.
+        Useful for rough transmit pacing; not a substitute for a link budget tool.
         """
         sf = int(self.sf)
         bw_hz = self.bw_khz * 1000
         cr_denom = {1: 5, 2: 6, 3: 7, 4: 8}[int(self.cr)]
         # symbols
-        tsym_ms = (2 ** sf) / bw_hz * 1000.0
+        tsym_ms = (2**sf) / bw_hz * 1000.0
         # payload symbols (simplified, header enabled, CRC on, no low-data-rate opt correction
         # except SF11/12 @125k which need DE=1)
         de = 1 if (sf >= 11 and bw_hz == 125000) else 0
         ih, crc_on = 0, 1
         import math
+
         num = 8 * payload_bytes - 4 * sf + 28 + 16 * crc_on - 20 * ih
         den = 4 * (sf - 2 * de)
         payload_sym = 8 + max(0, math.ceil(num / den)) * cr_denom
         return (8 + 4.25 + payload_sym) * tsym_ms  # 8-symbol preamble + sync
 
     @classmethod
-    def pair(cls, addr_a: int = 0, addr_b: int = 0, channel: int = 18,
-             band: str = "HF", **overrides: Any) -> tuple["LoraConfig", "LoraConfig"]:
+    def pair(
+        cls, addr_a: int = 0, addr_b: int = 0, channel: int = 18, band: str = "HF", **overrides: Any
+    ) -> tuple[LoraConfig, LoraConfig]:
         """Two stream-mode configs that talk to each other out of the box."""
-        base = dict(sf=7, mode=1, txch=channel, rxch=channel, band=band)
+        base = {"sf": 7, "mode": 1, "txch": channel, "rxch": channel, "band": band}
         base.update(overrides)
         return cls(addr=addr_a, **base), cls(addr=addr_b, **base)
 

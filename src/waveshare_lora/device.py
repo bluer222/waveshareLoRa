@@ -14,7 +14,8 @@ Typical use — paired stream-mode JSON link::
 
     asyncio.run(main())
 
-Packet mode (AT+MODE=2) adds per-fragment 3-byte addressing::
+Packet mode (AT+MODE=2) adds a 3-byte destination prefix to one bounded
+frame::
 
     await dev.send_json({"cmd": "on"}, dest_addr=0x0005, dest_channel=18)
 
@@ -26,44 +27,67 @@ messages on an :class:`asyncio.Queue`.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+import contextlib
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from . import at as _at
 from .codec import (
     DEFAULT_MTU,
-    PACKET_MODE_OVERHEAD,
+    HEADER_LEN,
     DecodedMessage,
     StreamDecoder,
     encode_json,
     encode_raw,
     packet_prefix,
 )
-from .config import LoraConfig, OperationMode, comm_to_pyserial
+from .config import (
+    CACHE_BYTES,
+    MAX_AIR_SINGLE,
+    VALID_BAUDS,
+    LoraConfig,
+    OperationMode,
+    comm_to_pyserial,
+)
 
 _AT_OK_TOKENS = (b"OK", b"+OK")
-
-
-@dataclass
-class Received:
-    data: Any
-    meta: Any  # FrameMeta (+ src/channel filled when known)
+RADIO_CACHE_BYTES = CACHE_BYTES
 
 
 class LoRaDevice:
-    """Async USB-TO-LoRa endpoint."""
+    """Async USB-TO-LoRa endpoint.
 
-    def __init__(self, port: str, config: LoraConfig | None = None,
-                 serial_baud: int | None = None,
-                 mtu: int = DEFAULT_MTU,
-                 queue_size: int = 128,
-                 compress_level: int = 9,
-                 at_timeout: float = 2.5) -> None:
+    ``mtu`` caps application fragment size. ``tx_chunk_size`` also caps each
+    serial write. Both are bounded by the 240-byte RF packet limit.
+    """
+
+    def __init__(
+        self,
+        port: str,
+        config: LoraConfig | None = None,
+        serial_baud: int | None = None,
+        mtu: int = DEFAULT_MTU,
+        queue_size: int = 128,
+        compress_level: int = 9,
+        at_timeout: float = 2.5,
+        *,
+        tx_chunk_size: int = RADIO_CACHE_BYTES,
+    ) -> None:
         self.port = port
         self.config = config or LoraConfig()
         # Host-side serial baud: must equal the device's AT+BAUD while talking.
-        self.serial_baud = serial_baud or int(self.config.baud)
+        self.serial_baud = int(self.config.baud if serial_baud is None else serial_baud)
+        if self.serial_baud not in VALID_BAUDS:
+            raise ValueError(f"serial_baud must be one of {VALID_BAUDS}")
+        self.serial_comm = self.config.comm
+        min_mtu = HEADER_LEN + 1 + (3 if self.packet_mode else 0)
+        if not min_mtu <= mtu <= MAX_AIR_SINGLE:
+            raise ValueError(f"mtu must be {min_mtu}..{MAX_AIR_SINGLE}")
         self.mtu = mtu
+        min_chunk = HEADER_LEN + 1 + (3 if self.packet_mode else 0)
+        if not min_chunk <= tx_chunk_size <= RADIO_CACHE_BYTES:
+            raise ValueError(f"tx_chunk_size must be {min_chunk}..{RADIO_CACHE_BYTES}")
+        self.tx_chunk_size = tx_chunk_size
         self.compress_level = compress_level
         self.at_timeout = at_timeout
 
@@ -71,62 +95,159 @@ class LoRaDevice:
         self._writer: asyncio.StreamWriter | None = None
         self._rx_task: asyncio.Task | None = None
         self._write_lock = asyncio.Lock()
+        self._io_lock = asyncio.Lock()
+        self._io_owner: asyncio.Task | None = None
+        self._io_depth = 0
         self._seq = 0
-        self._decoder = StreamDecoder(
-            rssi_trailer=1 if self.config.rssi else 0)
+        self._decoder = self._new_decoder()
         self.queue: asyncio.Queue[DecodedMessage] = asyncio.Queue(maxsize=queue_size)
 
         # AT-session state (reader task routes bytes here while set)
         self._at_mode = False
         self._at_buf = bytearray()
         self._at_event = asyncio.Event()
+        self._exit_command_confirmed = False
 
     # -- properties ------------------------------------------------------
     @property
     def is_open(self) -> bool:
-        return self._writer is not None and not self._writer.is_closing()
+        return (
+            self._writer is not None
+            and not self._writer.is_closing()
+            and self._reader is not None
+            and self._rx_task is not None
+            and not self._rx_task.done()
+        )
 
     @property
     def packet_mode(self) -> bool:
         return int(self.config.mode) == int(OperationMode.PACKET)
 
-    def _air_mtu(self) -> int:
-        return self.mtu - PACKET_MODE_OVERHEAD if self.packet_mode else self.mtu
+    def _new_decoder(self) -> StreamDecoder:
+        return StreamDecoder(rssi_trailer=1 if self.config.rssi else 0)
+
+    async def _acquire_io(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("serial I/O requires an asyncio task")
+        if self._io_owner is task:
+            self._io_depth += 1
+            return
+        await self._io_lock.acquire()
+        self._io_owner = task
+        self._io_depth = 1
+
+    def _release_io(self) -> None:
+        if self._io_owner is not asyncio.current_task():
+            raise RuntimeError("serial I/O lock owned by another task")
+        self._io_depth -= 1
+        if self._io_depth == 0:
+            self._io_owner = None
+            self._io_lock.release()
+
+    @contextlib.asynccontextmanager
+    async def _io_guard(self):
+        await self._acquire_io()
+        try:
+            yield
+        finally:
+            self._release_io()
 
     # -- lifecycle ---------------------------------------------------------
     async def connect(self) -> None:
-        if self.is_open:
-            return
-        import serial_asyncio
+        async with self._io_guard():
+            if self.is_open:
+                return
+            if self._writer is not None:
+                await self.disconnect()
+            import serial_asyncio
 
-        extra = comm_to_pyserial(self.config.comm)
-        extra.pop("_device_databits", None)
-        self._reader, self._writer = await serial_asyncio.open_serial_connection(
-            url=self.port, baudrate=self.serial_baud,
-            bytesize=extra["bytesize"], parity=extra["parity"],
-            stopbits=extra["stopbits"], timeout=None)
-        self._decoder = StreamDecoder(
-            rssi_trailer=1 if self.config.rssi else 0)
-        # drain stale boot bytes (module prints nothing, but USB re-enumeration can)
-        self._rx_task = asyncio.create_task(self._read_loop(), name=f"lora-rx-{self.port}")
+            extra = comm_to_pyserial(self.serial_comm)
+            extra.pop("_device_databits", None)
+            self._reader, self._writer = await serial_asyncio.open_serial_connection(
+                url=self.port,
+                baudrate=self.serial_baud,
+                bytesize=extra["bytesize"],
+                parity=extra["parity"],
+                stopbits=extra["stopbits"],
+                timeout=None,
+            )
+            self._decoder = self._new_decoder()
+            # Start reading serial data in the background.
+            self._rx_task = asyncio.create_task(self._read_loop(), name=f"lora-rx-{self.port}")
 
     async def disconnect(self) -> None:
-        if self._rx_task:
-            self._rx_task.cancel()
-            try:
-                await self._rx_task
-            except asyncio.CancelledError:
-                pass
-            self._rx_task = None
-        if self._writer:
-            try:
-                self._writer.close()
-                await self._writer.wait_closed()
-            except Exception:
-                pass
-        self._reader = self._writer = None
+        async with self._io_guard():
+            cancelled = False
+            reader_error: Exception | None = None
+            if self._rx_task:
+                task = self._rx_task
+                task.cancel()
+                while not task.done():
+                    try:
+                        await asyncio.wait({task})
+                    except asyncio.CancelledError:
+                        cancelled = True
+                if not task.cancelled():
+                    try:
+                        task.result()
+                    except OSError:
+                        pass
+                    except Exception as exc:  # noqa: BLE001 - close port before re-raising
+                        reader_error = exc
+                self._rx_task = None
+            if self._writer:
+                try:
+                    self._writer.close()
+                    close_wait = asyncio.create_task(self._writer.wait_closed())
+                    while not close_wait.done():
+                        try:
+                            await asyncio.shield(close_wait)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                    await close_wait
+                except OSError:  # port already gone
+                    pass
+            self._reader = self._writer = None
+            if reader_error is not None:
+                raise reader_error
+            if cancelled:
+                raise asyncio.CancelledError
 
-    async def __aenter__(self) -> "LoRaDevice":
+    async def _reopen_for_config(self, cfg: LoraConfig) -> bool:
+        """Finish a UART setting change despite cancellation; report any cancellation."""
+        cancelled = False
+        while True:
+            try:
+                await self.disconnect()
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+        self.serial_baud = int(cfg.baud)
+        self.serial_comm = cfg.comm
+        self.config = cfg
+        while True:
+            try:
+                await self.connect()
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+        return cancelled
+
+    @staticmethod
+    async def _wait_for_reboot() -> bool:
+        """Wait through cancellation and report it to the caller."""
+        wait = asyncio.create_task(asyncio.sleep(3.2))
+        cancelled = False
+        while not wait.done():
+            try:
+                await asyncio.shield(wait)
+            except asyncio.CancelledError:
+                cancelled = True
+        await wait
+        return cancelled
+
+    async def __aenter__(self) -> LoRaDevice:  # noqa: PYI034
         await self.connect()
         return self
 
@@ -138,28 +259,33 @@ class LoRaDevice:
         assert self._reader is not None
         try:
             while True:
-                chunk = await self._reader.read(1024)
-                if not chunk:  # EOF / disconnect
-                    await asyncio.sleep(0.05)
-                    continue
+                try:
+                    chunk = await asyncio.wait_for(self._reader.read(1024), timeout=1.0)
+                except asyncio.TimeoutError:
+                    chunk = b""  # tick the decoder so stalled frames can expire
+                eof = not chunk and self._reader.at_eof()
                 if self._at_mode:
+                    if not chunk:
+                        if eof:
+                            return
+                        continue
                     self._at_buf += chunk
                     if self._looks_like_at_reply():
                         self._at_event.set()
                 else:
-                    for msg in self._decoder.feed(chunk):
+                    for msg in self._decoder.feed(chunk, final=eof):
                         try:
                             self.queue.put_nowait(msg)
                         except asyncio.QueueFull:
                             # drop oldest, keep newest (sensor link semantics)
-                            try:
+                            with contextlib.suppress(asyncio.QueueEmpty):
                                 self.queue.get_nowait()
-                            except asyncio.QueueEmpty:
-                                pass
                             self.queue.put_nowait(msg)
+                if eof:
+                    return
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except OSError:  # port gone / SerialException (subclass of OSError)
             return  # serial error ends loop; is_open reflects state
 
     def _looks_like_at_reply(self) -> bool:
@@ -177,6 +303,8 @@ class LoRaDevice:
     async def _at(self, cmd: str, timeout: float | None = None) -> _at.AtReply:
         """Send one AT command, wait for OK/ERROR. Must be inside AT mode,
         except for the ``+++`` entry command itself."""
+        if self._io_owner is not asyncio.current_task():
+            raise RuntimeError("AT command requires an active AT session")
         timeout = timeout if timeout is not None else self.at_timeout
         self._at_buf = bytearray()
         self._at_event.clear()
@@ -197,133 +325,232 @@ class LoRaDevice:
 
     async def enter_at_mode(self, timeout: float | None = None) -> None:
         timeout = timeout if timeout is not None else self.at_timeout
+        already_owned = self._at_mode and self._io_owner is asyncio.current_task()
+        if not already_owned:
+            await self._acquire_io()
         self._at_mode = True
         try:
             await self._at("+++", timeout=timeout)
-        except Exception:
+        except BaseException:
             self._at_mode = False
+            self._release_io()
             raise
 
     async def exit_at_mode(self) -> None:
+        if self._io_owner is not asyncio.current_task() or not self._at_mode:
+            raise RuntimeError("AT mode is owned by another task or is not active")
         try:
-            await self._at(_at.AT_EXIT, timeout=5.0)
-        finally:
-            self._at_mode = False
-        # module reboots on EXIT; give it time before data flows again
-        await asyncio.sleep(3.2)
-        # flush any reboot garbage so the frame scanner starts clean
-        self._decoder = StreamDecoder(rssi_trailer=1 if self.config.rssi else 0)
-        while not self.queue.empty():
+            self._exit_command_confirmed = False
+            exit_error: BaseException | None = None
             try:
-                self.queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+                await self._at(_at.AT_EXIT, timeout=5.0)
+                self._exit_command_confirmed = True
+            except (TimeoutError, RuntimeError, OSError, asyncio.CancelledError) as exc:
+                exit_error = exc
+            finally:
+                self._at_mode = False
+            # module reboots on EXIT; give it time before data flows again
+            cancelled_during_wait = await self._wait_for_reboot()
+            # flush any reboot garbage so the frame scanner starts clean
+            self._decoder = self._new_decoder()
+            while not self.queue.empty():
+                try:
+                    self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            if exit_error is not None:
+                raise exit_error
+            if cancelled_during_wait:
+                raise asyncio.CancelledError
+        finally:
+            self._release_io()
 
     async def get_version(self) -> str:
-        was_in = self._at_mode
+        was_in = self._at_mode and self._io_owner is asyncio.current_task()
         if not was_in:
             await self.enter_at_mode()
         try:
             rep = await self._at(_at.AT_VER)
-            return rep.value or rep.raw.strip()
-        finally:
+        except BaseException:
             if not was_in:
-                await self.exit_at_mode()
+                with contextlib.suppress(BaseException):
+                    await self.exit_at_mode()
+            raise
+        if not was_in:
+            await self.exit_at_mode()
+        return rep.value or rep.raw.strip()
 
     async def factory_reset(self) -> None:
         await self.apply_config(LoraConfig(band=self.config.band), restore_first=True)
 
     async def read_config(self) -> LoraConfig:
         """Read the live device config via ``AT+ALLP?`` (reboots on EXIT)."""
-        was_in = self._at_mode
+        was_in = self._at_mode and self._io_owner is asyncio.current_task()
         if not was_in:
             await self.enter_at_mode()
         try:
             rep = await self._at(_at.AT_ALLP_QUERY, timeout=5.0)
             cfg = LoraConfig.from_allp(rep.raw, band=str(self.config.band))
             cfg.band = self.config.band  # band is host-side, not stored on device
-            return cfg
-        finally:
+        except BaseException:
             if not was_in:
-                await self.exit_at_mode()
+                with contextlib.suppress(BaseException):
+                    await self.exit_at_mode()
+            raise
+        if not was_in:
+            await self.exit_at_mode()
+        return cfg
 
-    async def apply_config(self, cfg: LoraConfig | None = None,
-                           restore_first: bool = False,
-                           use_allp: bool = True) -> None:
+    async def apply_config(
+        self, cfg: LoraConfig | None = None, restore_first: bool = False, use_allp: bool = True
+    ) -> None:
         """Write *cfg* to the module. Uses one ``AT+AllP=`` write by default.
 
-        WARNING: changing ``baud`` re-opens the host serial port at the new rate
-        after the module reboots.
+        Changing ``baud`` or ``comm`` re-opens the host serial port after the
+        module reboots.
         """
         cfg = cfg or self.config
         cfg.validate()
-        await self.enter_at_mode()
-        try:
-            if restore_first:
-                try:
-                    await self._at("AT+RESTORE=1")
-                    await asyncio.sleep(3.2)
-                    await self.enter_at_mode()
-                except Exception:
-                    pass  # older firmware may lack RESTORE reply; continue
-            if use_allp:
-                await self._at(cfg.to_allp(), timeout=5.0)
-            else:
-                for cmd in cfg.to_at_commands():
-                    await self._at(cmd)
-        finally:
-            # EXIT even on failure so the module is never stuck in AT mode
+        if int(cfg.mode) == int(OperationMode.PACKET) and min(self.mtu, self.tx_chunk_size) < 21:
+            raise ValueError("packet mode requires mtu and tx_chunk_size of at least 21 bytes")
+        async with self._io_guard():
+            if self._at_mode:
+                raise RuntimeError("apply_config cannot run inside an AT session")
+            await self.enter_at_mode()
             try:
-                await self.exit_at_mode()
-            except Exception:
-                self._at_mode = False
-        new_baud = int(cfg.baud)
-        if new_baud != self.serial_baud:
-            await self.disconnect()
-            self.serial_baud = new_baud
-            await self.connect()
-        self.config = cfg
-        self._decoder.rssi_trailer = 1 if cfg.rssi else 0
+                if restore_first:
+                    try:
+                        await self._at("AT+RESTORE=1")
+                    except TimeoutError:
+                        pass  # firmware may reboot without replying
+                    cancelled_after_restore = await self._wait_for_reboot()
+                    # RESTORE reboots into factory UART settings. The old AT
+                    # session no longer has a usable serial connection.
+                    self._at_mode = False
+                    self._release_io()
+                    defaults = LoraConfig(band=self.config.band)
+                    cancelled_after_restore |= await self._reopen_for_config(defaults)
+                    if cancelled_after_restore:
+                        raise asyncio.CancelledError
+                    await self.enter_at_mode()
+                if use_allp:
+                    await self._at(cfg.to_allp(), timeout=5.0)
+                else:
+                    for cmd in cfg.to_at_commands():
+                        await self._at(cmd)
+            except BaseException:
+                # Preserve the write failure after attempting to leave AT mode.
+                if self._at_mode:
+                    with contextlib.suppress(BaseException):
+                        await self.exit_at_mode()
+                raise
+            else:
+                cancelled_after_exit = False
+                try:
+                    await self.exit_at_mode()
+                except asyncio.CancelledError:
+                    if not self._exit_command_confirmed:
+                        raise
+                    cancelled_after_exit = True
+            new_baud = int(cfg.baud)
+            new_comm = cfg.comm
+            if new_baud != self.serial_baud or new_comm != self.serial_comm:
+                cancelled_after_exit |= await self._reopen_for_config(cfg)
+            else:
+                self.config = cfg
+                self._decoder = self._new_decoder()
+            if cancelled_after_exit:
+                raise asyncio.CancelledError
 
     # -- JSON transport ------------------------------------------------------------
     def _next_seq(self) -> int:
         self._seq = (self._seq + 1) & 0xFFFF
         return self._seq
 
-    async def send_json(self, obj: Any, dest_addr: int | None = None,
-                        dest_channel: int | None = None,
-                        pace: bool = True) -> int:
-        """Encode + transmit a JSON object. Returns air bytes written.
+    async def send_json(
+        self,
+        obj: Any,
+        dest_addr: int | None = None,
+        dest_channel: int | None = None,
+        pace: bool = True,
+    ) -> int:
+        """Encode + transmit one JSON message. Return bytes submitted to USB.
 
-        In packet mode *dest_addr*/*dest_channel* are required (3-byte prefix
-        per fragment); in stream mode they must be None (transparent).
+        In packet mode *dest_addr*/*dest_channel* are required. The message
+        and routing prefix must fit in one RF packet (240 bytes total).
         """
+        async with self._io_guard():
+            if self._at_mode:
+                raise RuntimeError("cannot send while in AT mode")
+            self._validate_destination(dest_addr, dest_channel)
+            mtu = min(self.mtu, self.tx_chunk_size, MAX_AIR_SINGLE) - (
+                3 if self.packet_mode else 0
+            )
+            frames = encode_json(obj, self._next_seq(), mtu=mtu, compress_level=self.compress_level)
+            return await self._send_frames(frames, dest_addr, dest_channel, pace)
+
+    async def send_raw(
+        self,
+        data: bytes,
+        dest_addr: int | None = None,
+        dest_channel: int | None = None,
+        pace: bool = True,
+    ) -> int:
+        async with self._io_guard():
+            if self._at_mode:
+                raise RuntimeError("cannot send while in AT mode")
+            self._validate_destination(dest_addr, dest_channel)
+            mtu = min(self.mtu, self.tx_chunk_size, MAX_AIR_SINGLE) - (
+                3 if self.packet_mode else 0
+            )
+            frames = encode_raw(bytes(data), self._next_seq(), mtu=mtu, compress_level=self.compress_level)
+            return await self._send_frames(frames, dest_addr, dest_channel, pace)
+
+    def _validate_destination(self, dest_addr: int | None, dest_channel: int | None) -> None:
         if self.packet_mode and (dest_addr is None or dest_channel is None):
             raise ValueError("packet mode requires dest_addr and dest_channel")
         if not self.packet_mode and (dest_addr is not None or dest_channel is not None):
             raise ValueError("dest_* only valid in packet mode (AT+MODE=2)")
-        frags = encode_json(obj, self._next_seq(), mtu=self._air_mtu(),
-                            compress_level=self.compress_level)
-        return await self._send_fragments(frags, dest_addr, dest_channel, pace)
 
-    async def send_raw(self, data: bytes, dest_addr: int | None = None,
-                       dest_channel: int | None = None, pace: bool = True) -> int:
-        frags = encode_raw(bytes(data), self._next_seq(), mtu=self._air_mtu(),
-                           compress_level=self.compress_level)
-        return await self._send_fragments(frags, dest_addr, dest_channel, pace)
+    def _estimate_batch_airtime_ms(self, size: int) -> float:
+        """Estimate drain time using max-size packets, UART rate, and LBT delay."""
+        serial_size = size
+        airtime_ms = 0.0
+        while size:
+            packet_size = min(MAX_AIR_SINGLE, size)
+            lbt_delay = 2000.0 if self.config.lbt else 0.0
+            airtime_ms += self.config.estimate_airtime_ms(packet_size) + 50.0 + lbt_delay
+            size -= packet_size
+        comm = self.config.comm.upper()
+        bits_per_byte = 1 + 8 + (comm[1] != "N") + max(1, int(comm[2]))
+        serial_ms = serial_size * bits_per_byte * 1000.0 / self.serial_baud
+        return max(airtime_ms, serial_ms)
 
-    async def _send_fragments(self, frags: list[bytes], dest_addr: int | None,
-                              dest_channel: int | None, pace: bool) -> int:
-        prefix = packet_prefix(dest_addr, dest_channel) if self.packet_mode else b""
-        total = 0
-        for f in frags:
-            await self._write(prefix + f)
-            total += len(prefix) + len(f)
-            if pace and len(frags) > 1:
-                # airtime-proportional pacing: the radio (not USB) is the bottleneck
-                ms = self.config.estimate_airtime_ms(len(f))
-                await asyncio.sleep(min(2.0, ms / 1000.0 + 0.05))
-        return total
+    async def _send_frames(
+        self, frames: list[bytes], dest_addr: int | None, dest_channel: int | None, pace: bool
+    ) -> int:
+        async with self._io_guard():
+            if self._at_mode:
+                raise RuntimeError("cannot send while in AT mode")
+            prefix = packet_prefix(dest_addr, dest_channel) if self.packet_mode else b""
+            if self.config.rssi and len(frames) > 1:
+                raise ValueError("RSSI mode requires a message to fit in one RF packet")
+            if self.packet_mode and len(frames) > 1:
+                raise ValueError("packet-mode message must fit in one serial batch and RF packet")
+            if (self.packet_mode or self.config.rssi) and not pace:
+                raise ValueError("packet and RSSI modes require pacing between sends")
+            total = 0
+            for frame in frames:
+                batch = prefix + frame
+                if len(batch) > min(self.tx_chunk_size, MAX_AIR_SINGLE):
+                    raise ValueError("frame exceeds serial batch or RF packet limit")
+                await self._write(batch)
+                total += len(batch)
+                if pace:
+                    # Pacing is an estimate, not a transmit-complete signal.
+                    wait_ms = self._estimate_batch_airtime_ms(len(batch))
+                    await asyncio.sleep(wait_ms / 1000.0)
+            return total
 
     async def recv(self, timeout: float | None = None) -> DecodedMessage:
         try:

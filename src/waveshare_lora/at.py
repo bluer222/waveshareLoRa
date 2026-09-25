@@ -20,8 +20,21 @@ ENTER_AT: Final[bytes] = b"+++\r\n"
 
 # canonical parameter commands in AllP order
 PARAM_CMDS: Final[tuple[str, ...]] = (
-    "SF", "BW", "CR", "PWR", "NETID", "LBT", "MODE",
-    "TXCH", "RXCH", "RSSI", "ADDR", "PORT", "BAUD", "COMM", "KEY",
+    "SF",
+    "BW",
+    "CR",
+    "PWR",
+    "NETID",
+    "LBT",
+    "MODE",
+    "TXCH",
+    "RXCH",
+    "RSSI",
+    "ADDR",
+    "PORT",
+    "BAUD",
+    "COMM",
+    "KEY",
 )
 
 AT_EXIT: Final[str] = "AT+EXIT"
@@ -47,8 +60,8 @@ _VALUE_RE = re.compile(r"^[+:A-Za-z]*\+?([A-Za-z]+)\s*[:=]\s*(.+?)\s*$")
 class AtReply:
     raw: str
     ok: bool
-    value: str | None = None   # value after ':'/'=' if present
-    cmd: str | None = None     # command name if identifiable
+    value: str | None = None  # value after ':'/'=' if present
+    cmd: str | None = None  # command name if identifiable
 
 
 def parse_reply(raw: bytes | str, expect: str | None = None) -> AtReply:

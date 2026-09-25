@@ -21,9 +21,18 @@ async def main() -> None:
     ap.add_argument("--read-only", action="store_true")
     args = ap.parse_args()
 
-    cfg = LoraConfig(txch=args.channel, rxch=args.channel, band=args.band,
-                     mode=args.mode, addr=args.addr, sf=args.sf,
-                     pwr=args.pwr, key=args.key, rssi=args.rssi, lbt=args.lbt)
+    cfg = LoraConfig(
+        txch=args.channel,
+        rxch=args.channel,
+        band=args.band,
+        mode=args.mode,
+        addr=args.addr,
+        sf=args.sf,
+        pwr=args.pwr,
+        key=args.key,
+        rssi=args.rssi,
+        lbt=args.lbt,
+    )
     async with LoRaDevice(args.port, config=cfg) as dev:
         if args.read_only:
             live = await dev.read_config()
