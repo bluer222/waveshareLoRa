@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Async Python library for JSON over Waveshare USB-TO-LoRa-xF (SX1262)"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "AGPL-3.0-only" }
 keywords = ["lora", "sx1262", "waveshare", "usb", "asyncio", "json"]
 dependencies = [
   "pyserial>=3.5",
