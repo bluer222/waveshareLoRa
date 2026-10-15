@@ -969,3 +969,13 @@ def test_raw_bytes_roundtrip():
 
 def test_relay_addr_helper():
     assert LoraConfig.relay_addr(0x03, 0x04) == 0x0304
+
+
+def test_fits_one_frame_matches_fragment_count():
+    from waveshare_lora import fits_one_frame
+    assert fits_one_frame({"a": 1})
+    big = [str(n) * 3 for n in range(400)]
+    assert not fits_one_frame(big)
+    assert len(C.encode_json(big, 0)) > 1
+    too_many_fragments = random.Random(1).randbytes(60000).hex()
+    assert not fits_one_frame(too_many_fragments)

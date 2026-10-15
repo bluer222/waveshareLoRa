@@ -39,6 +39,7 @@ from .codec import (
     StreamDecoder,
     encode_json,
     encode_raw,
+    fits_one_frame,
     packet_prefix,
 )
 from .config import (
@@ -467,6 +468,15 @@ class LoRaDevice:
         self._seq = (self._seq + 1) & 0xFFFF
         return self._seq
 
+    @property
+    def frame_mtu(self) -> int:
+        """Largest fragment this device sends, after any packet-mode prefix."""
+        return min(self.mtu, self.tx_chunk_size, MAX_AIR_SINGLE) - (3 if self.packet_mode else 0)
+
+    def fits_one_packet(self, obj: Any) -> bool:
+        """Whether ``send_json(obj)`` would go out as a single RF packet."""
+        return fits_one_frame(obj, mtu=self.frame_mtu, compress_level=self.compress_level)
+
     async def send_json(
         self,
         obj: Any,
@@ -483,10 +493,7 @@ class LoRaDevice:
             if self._at_mode:
                 raise RuntimeError("cannot send while in AT mode")
             self._validate_destination(dest_addr, dest_channel)
-            mtu = min(self.mtu, self.tx_chunk_size, MAX_AIR_SINGLE) - (
-                3 if self.packet_mode else 0
-            )
-            frames = encode_json(obj, self._next_seq(), mtu=mtu, compress_level=self.compress_level)
+            frames = encode_json(obj, self._next_seq(), mtu=self.frame_mtu, compress_level=self.compress_level)
             return await self._send_frames(frames, dest_addr, dest_channel, pace)
 
     async def send_raw(
@@ -500,10 +507,7 @@ class LoRaDevice:
             if self._at_mode:
                 raise RuntimeError("cannot send while in AT mode")
             self._validate_destination(dest_addr, dest_channel)
-            mtu = min(self.mtu, self.tx_chunk_size, MAX_AIR_SINGLE) - (
-                3 if self.packet_mode else 0
-            )
-            frames = encode_raw(bytes(data), self._next_seq(), mtu=mtu, compress_level=self.compress_level)
+            frames = encode_raw(bytes(data), self._next_seq(), mtu=self.frame_mtu, compress_level=self.compress_level)
             return await self._send_frames(frames, dest_addr, dest_channel, pace)
 
     def _validate_destination(self, dest_addr: int | None, dest_channel: int | None) -> None:

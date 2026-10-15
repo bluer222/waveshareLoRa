@@ -117,6 +117,11 @@ MAGIC 2B | VERFLAGS 1B | SEQ 2B | TOTAL 2B | IDX 1B | COUNT 1B | FRAG_LEN 2B | H
 
 Typical sensor JSON compresses 50–80 %; each fragment has a 17-byte header.
 
+A multi-fragment message is lost if any fragment is lost. When the data has
+no internal relations, pack it into messages that pass
+`LoRaDevice.fits_one_packet(obj)` (or `fits_one_frame(obj, mtu)`), so each RF
+packet decodes on its own.
+
 ## Layout
 
 ```

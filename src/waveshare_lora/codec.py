@@ -114,6 +114,18 @@ def encode_json(
     return _fragment(payload, seq, compressed=compressed, raw=False, mtu=mtu)
 
 
+def fits_one_frame(obj: Any, mtu: int = DEFAULT_MTU, compress_level: int = 9) -> bool:
+    """Whether *obj* encodes to a single fragment, which travels as one RF packet.
+
+    A one-fragment message survives on its own: losing another packet cannot
+    make it undecodable. Callers can pack independent data into such messages.
+    """
+    try:
+        return len(encode_json(obj, 0, mtu=mtu, compress_level=compress_level)) == 1
+    except ValueError:
+        return False
+
+
 def encode_raw(
     data: bytes, seq: int, mtu: int = DEFAULT_MTU, compress_level: int = 9
 ) -> list[bytes]:

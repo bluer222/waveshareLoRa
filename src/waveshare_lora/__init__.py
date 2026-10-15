@@ -7,6 +7,7 @@ from .codec import (
     decode_fragments,
     encode_json,
     encode_raw,
+    fits_one_frame,
     packet_prefix,
     packet_split,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "decode_fragments",
     "encode_json",
     "encode_raw",
+    "fits_one_frame",
     "packet_prefix",
     "packet_split",
 ]
