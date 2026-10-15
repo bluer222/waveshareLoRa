@@ -14,8 +14,11 @@ Typical use — paired stream-mode JSON link::
 
     asyncio.run(main())
 
-Packet mode (AT+MODE=2) adds a 3-byte destination prefix to one bounded
-frame::
+Every message is one frame and one RF packet (at most 240 bytes), so a lost
+packet never damages another message. ``fits(obj)`` checks before sending;
+``send_json`` raises :class:`codec.MessageTooLarge` otherwise.
+
+Packet mode (AT+MODE=2) adds a 3-byte destination prefix to the frame::
 
     await dev.send_json({"cmd": "on"}, dest_addr=0x0005, dest_channel=18)
 
@@ -33,18 +36,16 @@ from typing import Any
 
 from . import at as _at
 from .codec import (
-    DEFAULT_MTU,
     HEADER_LEN,
+    MAX_FRAME,
     DecodedMessage,
     StreamDecoder,
     encode_json,
     encode_raw,
-    fits_one_frame,
+    fits_json,
     packet_prefix,
 )
 from .config import (
-    CACHE_BYTES,
-    MAX_AIR_SINGLE,
     VALID_BAUDS,
     LoraConfig,
     OperationMode,
@@ -52,14 +53,14 @@ from .config import (
 )
 
 _AT_OK_TOKENS = (b"OK", b"+OK")
-RADIO_CACHE_BYTES = CACHE_BYTES
+PACKET_PREFIX_LEN = 3
 
 
 class LoRaDevice:
     """Async USB-TO-LoRa endpoint.
 
-    ``mtu`` caps application fragment size. ``tx_chunk_size`` also caps each
-    serial write. Both are bounded by the 240-byte RF packet limit.
+    ``max_frame`` caps each serial write, packet-mode prefix included. It is
+    bounded by the 240-byte RF packet limit; lower it only for testing.
     """
 
     def __init__(
@@ -67,12 +68,11 @@ class LoRaDevice:
         port: str,
         config: LoraConfig | None = None,
         serial_baud: int | None = None,
-        mtu: int = DEFAULT_MTU,
         queue_size: int = 128,
         compress_level: int = 9,
         at_timeout: float = 2.5,
         *,
-        tx_chunk_size: int = RADIO_CACHE_BYTES,
+        max_frame: int = MAX_FRAME,
     ) -> None:
         self.port = port
         self.config = config or LoraConfig()
@@ -81,14 +81,10 @@ class LoRaDevice:
         if self.serial_baud not in VALID_BAUDS:
             raise ValueError(f"serial_baud must be one of {VALID_BAUDS}")
         self.serial_comm = self.config.comm
-        min_mtu = HEADER_LEN + 1 + (3 if self.packet_mode else 0)
-        if not min_mtu <= mtu <= MAX_AIR_SINGLE:
-            raise ValueError(f"mtu must be {min_mtu}..{MAX_AIR_SINGLE}")
-        self.mtu = mtu
-        min_chunk = HEADER_LEN + 1 + (3 if self.packet_mode else 0)
-        if not min_chunk <= tx_chunk_size <= RADIO_CACHE_BYTES:
-            raise ValueError(f"tx_chunk_size must be {min_chunk}..{RADIO_CACHE_BYTES}")
-        self.tx_chunk_size = tx_chunk_size
+        smallest = HEADER_LEN + 1 + (PACKET_PREFIX_LEN if self.packet_mode else 0)
+        if not smallest <= max_frame <= MAX_FRAME:
+            raise ValueError(f"max_frame must be {smallest}..{MAX_FRAME}")
+        self.max_frame = max_frame
         self.compress_level = compress_level
         self.at_timeout = at_timeout
 
@@ -263,7 +259,7 @@ class LoRaDevice:
                 try:
                     chunk = await asyncio.wait_for(self._reader.read(1024), timeout=1.0)
                 except asyncio.TimeoutError:
-                    chunk = b""  # tick the decoder so stalled frames can expire
+                    chunk = b""
                 eof = not chunk and self._reader.at_eof()
                 if self._at_mode:
                     if not chunk:
@@ -412,8 +408,8 @@ class LoRaDevice:
         """
         cfg = cfg or self.config
         cfg.validate()
-        if int(cfg.mode) == int(OperationMode.PACKET) and min(self.mtu, self.tx_chunk_size) < 21:
-            raise ValueError("packet mode requires mtu and tx_chunk_size of at least 21 bytes")
+        if int(cfg.mode) == int(OperationMode.PACKET) and self.max_frame < HEADER_LEN + 1 + PACKET_PREFIX_LEN:
+            raise ValueError(f"packet mode requires max_frame of at least {HEADER_LEN + 1 + PACKET_PREFIX_LEN} bytes")
         async with self._io_guard():
             if self._at_mode:
                 raise RuntimeError("apply_config cannot run inside an AT session")
@@ -469,13 +465,13 @@ class LoRaDevice:
         return self._seq
 
     @property
-    def frame_mtu(self) -> int:
-        """Largest fragment this device sends, after any packet-mode prefix."""
-        return min(self.mtu, self.tx_chunk_size, MAX_AIR_SINGLE) - (3 if self.packet_mode else 0)
+    def frame_limit(self) -> int:
+        """Largest frame this device sends, after any packet-mode prefix."""
+        return self.max_frame - (PACKET_PREFIX_LEN if self.packet_mode else 0)
 
-    def fits_one_packet(self, obj: Any) -> bool:
-        """Whether ``send_json(obj)`` would go out as a single RF packet."""
-        return fits_one_frame(obj, mtu=self.frame_mtu, compress_level=self.compress_level)
+    def fits(self, obj: Any) -> bool:
+        """Whether ``send_json(obj)`` fits in one RF packet."""
+        return fits_json(obj, max_frame=self.frame_limit, compress_level=self.compress_level)
 
     async def send_json(
         self,
@@ -484,17 +480,17 @@ class LoRaDevice:
         dest_channel: int | None = None,
         pace: bool = True,
     ) -> int:
-        """Encode + transmit one JSON message. Return bytes submitted to USB.
+        """Encode + transmit one JSON message as one RF packet. Return bytes written.
 
-        In packet mode *dest_addr*/*dest_channel* are required. The message
-        and routing prefix must fit in one RF packet (240 bytes total).
+        Raises :class:`codec.MessageTooLarge` if it does not fit. In packet
+        mode *dest_addr*/*dest_channel* are required.
         """
         async with self._io_guard():
             if self._at_mode:
                 raise RuntimeError("cannot send while in AT mode")
             self._validate_destination(dest_addr, dest_channel)
-            frames = encode_json(obj, self._next_seq(), mtu=self.frame_mtu, compress_level=self.compress_level)
-            return await self._send_frames(frames, dest_addr, dest_channel, pace)
+            frame = encode_json(obj, self._next_seq(), max_frame=self.frame_limit, compress_level=self.compress_level)
+            return await self._send_frame(frame, dest_addr, dest_channel, pace)
 
     async def send_raw(
         self,
@@ -507,8 +503,8 @@ class LoRaDevice:
             if self._at_mode:
                 raise RuntimeError("cannot send while in AT mode")
             self._validate_destination(dest_addr, dest_channel)
-            frames = encode_raw(bytes(data), self._next_seq(), mtu=self.frame_mtu, compress_level=self.compress_level)
-            return await self._send_frames(frames, dest_addr, dest_channel, pace)
+            frame = encode_raw(bytes(data), self._next_seq(), max_frame=self.frame_limit, compress_level=self.compress_level)
+            return await self._send_frame(frame, dest_addr, dest_channel, pace)
 
     def _validate_destination(self, dest_addr: int | None, dest_channel: int | None) -> None:
         if self.packet_mode and (dest_addr is None or dest_channel is None):
@@ -516,45 +512,29 @@ class LoRaDevice:
         if not self.packet_mode and (dest_addr is not None or dest_channel is not None):
             raise ValueError("dest_* only valid in packet mode (AT+MODE=2)")
 
-    def _estimate_batch_airtime_ms(self, size: int) -> float:
-        """Estimate drain time using max-size packets, UART rate, and LBT delay."""
-        serial_size = size
-        airtime_ms = 0.0
-        while size:
-            packet_size = min(MAX_AIR_SINGLE, size)
-            lbt_delay = 2000.0 if self.config.lbt else 0.0
-            airtime_ms += self.config.estimate_airtime_ms(packet_size) + 50.0 + lbt_delay
-            size -= packet_size
+    def _estimate_send_ms(self, size: int) -> float:
+        """Estimate the time to send one packet: airtime, LBT delay, or UART rate."""
+        lbt_delay = 2000.0 if self.config.lbt else 0.0
+        airtime_ms = self.config.estimate_airtime_ms(size) + 50.0 + lbt_delay
         comm = self.config.comm.upper()
         bits_per_byte = 1 + 8 + (comm[1] != "N") + max(1, int(comm[2]))
-        serial_ms = serial_size * bits_per_byte * 1000.0 / self.serial_baud
+        serial_ms = size * bits_per_byte * 1000.0 / self.serial_baud
         return max(airtime_ms, serial_ms)
 
-    async def _send_frames(
-        self, frames: list[bytes], dest_addr: int | None, dest_channel: int | None, pace: bool
+    async def _send_frame(
+        self, frame: bytes, dest_addr: int | None, dest_channel: int | None, pace: bool
     ) -> int:
         async with self._io_guard():
             if self._at_mode:
                 raise RuntimeError("cannot send while in AT mode")
-            prefix = packet_prefix(dest_addr, dest_channel) if self.packet_mode else b""
-            if self.config.rssi and len(frames) > 1:
-                raise ValueError("RSSI mode requires a message to fit in one RF packet")
-            if self.packet_mode and len(frames) > 1:
-                raise ValueError("packet-mode message must fit in one serial batch and RF packet")
             if (self.packet_mode or self.config.rssi) and not pace:
                 raise ValueError("packet and RSSI modes require pacing between sends")
-            total = 0
-            for frame in frames:
-                batch = prefix + frame
-                if len(batch) > min(self.tx_chunk_size, MAX_AIR_SINGLE):
-                    raise ValueError("frame exceeds serial batch or RF packet limit")
-                await self._write(batch)
-                total += len(batch)
-                if pace:
-                    # Pacing is an estimate, not a transmit-complete signal.
-                    wait_ms = self._estimate_batch_airtime_ms(len(batch))
-                    await asyncio.sleep(wait_ms / 1000.0)
-            return total
+            batch = (packet_prefix(dest_addr, dest_channel) if self.packet_mode else b"") + frame
+            await self._write(batch)
+            if pace:
+                # Pacing is an estimate, not a transmit-complete signal.
+                await asyncio.sleep(self._estimate_send_ms(len(batch)) / 1000.0)
+            return len(batch)
 
     async def recv(self, timeout: float | None = None) -> DecodedMessage:
         try:

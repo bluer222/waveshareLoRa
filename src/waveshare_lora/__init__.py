@@ -3,11 +3,12 @@
 from .codec import (
     DecodedMessage,
     FrameMeta,
+    MessageTooLarge,
     StreamDecoder,
-    decode_fragments,
+    decode_frame,
     encode_json,
     encode_raw,
-    fits_one_frame,
+    fits_json,
     packet_prefix,
     packet_split,
 )
@@ -29,15 +30,16 @@ __all__ = [
     "FrequencyBand",
     "LoRaDevice",
     "LoraConfig",
+    "MessageTooLarge",
     "OperationMode",
     "SerialPort",
     "StreamDecoder",
-    "decode_fragments",
+    "decode_frame",
     "encode_json",
     "encode_raw",
-    "fits_one_frame",
+    "fits_json",
     "packet_prefix",
     "packet_split",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

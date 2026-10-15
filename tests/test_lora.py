@@ -1,7 +1,7 @@
 """Tests for config validation, AT helpers and the binary JSON codec.
 
 Hardware-free: the codec and AT layers are fully testable without a radio.
-Device tests use a loopback-style byte check via StreamDecoder.
+Device tests capture serial writes instead of using a radio.
 """
 
 import asyncio
@@ -14,7 +14,7 @@ import pytest
 from waveshare_lora import at as AT
 from waveshare_lora import codec as C
 from waveshare_lora.config import MAX_AIR_SINGLE, BandwidthIndex, LoraConfig, OperationMode
-from waveshare_lora.device import RADIO_CACHE_BYTES, LoRaDevice
+from waveshare_lora.device import LoRaDevice
 
 
 def test_defaults_validate():
@@ -112,360 +112,11 @@ def test_at_reply_parsing():
     assert AT.encode("AT+SF=7") == b"AT+SF=7\r\n"
 
 
-def test_codec_roundtrip_small():
-    obj = {"temp": 21.5, "id": 7}
-    frags = C.encode_json(obj, seq=1)
-    assert len(frags) == 1 and len(frags[0]) < 240
-    msg = C.decode_fragments(frags)
-    assert msg.data == obj
-    assert msg.meta.seq == 1
-
-
-def test_wire_header_layout():
-    frame = C.encode_raw(b"x", seq=0x1234)[0]
-
-    assert C.HEADER_LEN == 17
-    assert frame[:11] == bytes.fromhex("4c 4f 12 12 34 00 01 00 01 00 01")
-    assert len(frame) == C.HEADER_LEN + 1
-    assert frame[C.HEADER_LEN :] == b"x"
-    assert C.decode_fragments([frame]).data == b"x"
-
-
-def test_codec_compression_saves_bytes():
-    obj = {"sensor": "bme280", "readings": [21.5] * 30, "loc": "greenhouse-1"}
-    plain = len(json.dumps(obj, separators=(",", ":")).encode())
-    frags = C.encode_json(obj, seq=2)
-    air = sum(len(f) for f in frags)
-    assert air < plain  # zlib must win on repetitive JSON
-    assert C.decode_fragments(frags).data == obj
-
-
-def test_large_message_uses_bounded_application_fragments():
-    rng = random.Random(1234)
-    obj = {"blob": rng.randbytes(600).hex()}  # high-entropy: compresses poorly
-    frags = C.encode_json(obj, seq=42)
-    assert len(frags) > 1
-    assert all(len(frag) <= MAX_AIR_SINGLE for frag in frags)
-    dec = C.StreamDecoder()
-    out = []
-    # feed byte-by-byte to prove split-read safety
-    for f in frags:
-        for i in range(0, len(f), 7):
-            out += dec.feed(f[i : i + 7])
-    assert len(out) == 1 and out[0].data == obj and out[0].meta.count == len(frags)
-
-
-def test_encoder_keeps_mtu_argument_and_fragment_limit():
-    data = random.Random(5).randbytes(500)
-    keyword = C.encode_raw(data, seq=3, mtu=100, compress_level=0)
-    positional = C.encode_raw(data, 3, 100, 0)
-
-    assert keyword == positional
-    assert all(len(frame) <= 100 for frame in keyword)
-    assert C.decode_fragments(keyword).data == data
-    assert C.StreamDecoder(mtu=100).max_room == 100 - C.HEADER_LEN
-
-
-def test_codec_limits_decompressed_payload():
-    oversized = b"A" * (C.MAX_DECODED + 1)
-    with pytest.raises(ValueError, match="decoded message too large"):
-        C.encode_raw(oversized, seq=1)
-
-    compressed = C.zlib.compress(oversized)
-    frame = bytearray(C.HEADER_LEN + len(compressed))
-    C._pack_header(
-        frame,
-        (C.VERSION << 4) | C.FLAG_COMPRESSED | C.FLAG_RAW,
-        1,
-        len(compressed),
-        0,
-        1,
-        len(compressed),
-        C.crc32(compressed) & 0xFFFFFFFF,
-    )
-    frame[C.HEADER_LEN :] = compressed
-    with pytest.raises(ValueError, match="invalid message payload"):
-        C.decode_fragments([bytes(frame)])
-
-
-def test_decode_fragments_rejects_short_fragment():
-    frames = C.encode_raw(random.Random(5).randbytes(300), seq=1)
-    with pytest.raises(ValueError, match="truncated fragment header"):
-        C.decode_fragments([frames[0], b""])
-
-
-def test_codec_rejects_reserved_flags_and_trailing_bytes():
-    frame = C.encode_raw(b"ok", seq=1)[0]
-    changed = bytearray(frame)
-    h = C._unpack_header(frame)
-    assert h is not None
-    _, seq, total, idx, count, fl, msg_crc = h
-    C._pack_header(changed, (C.VERSION << 4) | C.FLAG_RAW | 0x04, seq, total, idx, count, fl, msg_crc)
-
-    assert C.StreamDecoder().feed(changed) == []
-    with pytest.raises(ValueError, match="fragment length"):
-        C.decode_fragments([frame + b"extra"])
-
-
-def test_decoder_resyncs_after_corrupt_large_frame():
-    broken = bytearray(C.encode_raw(b"x" * 500, seq=1)[0])
-    broken[-1] ^= 0xFF
-    next_frame = C.encode_json({"ok": True}, seq=2)[0]
-
-    msgs = C.StreamDecoder().feed(bytes(broken) + next_frame)
-
-    assert [msg.data for msg in msgs] == [{"ok": True}]
-
-
-def test_decoder_recovers_when_a_large_frame_is_truncated():
-    frame = C.encode_raw(random.Random(9).randbytes(4000), seq=1)[0]
-    next_frame = C.encode_json({"ok": True}, seq=2)[0]
-    dec = C.StreamDecoder()
-
-    assert dec.feed(frame[:100]) == []
-    assert dec.feed(next_frame) == []
-    dec._incomplete_last_input -= dec.partial_timeout + 1
-    msgs = dec.feed(b"")
-
-    assert [msg.data for msg in msgs] == [{"ok": True}]
-
-
-def test_truncated_fragment_does_not_block_continuous_messages():
-    frame = C.encode_raw(random.Random(9).randbytes(4000), seq=1)[0]
-    dec = C.StreamDecoder()
-
-    assert dec.feed(frame[:100]) == []
-    out = []
-    for i in range(20):
-        out.extend(dec.feed(C.encode_json({"n": i}, seq=i + 2)[0]))
-
-    assert out and out[-1].data == {"n": 19}
-
-
-def test_decoder_skips_impossible_single_frame_length():
-    bad = bytearray(C.HEADER_LEN)
-    C._pack_header(bad, C.VERSION << 4, 1, 1, 0, 1, 4000, 0)
-    good = C.encode_json({"ok": True}, seq=2)[0]
-
-    msgs = C.StreamDecoder().feed(bytes(bad) + good)
-
-    assert [msg.data for msg in msgs] == [{"ok": True}]
-
-
-def test_decoder_keeps_valid_nested_frame_in_raw_payload():
-    inner = C.encode_raw(b"inner", seq=2)[0]
-    outer = C.encode_raw(b"start" + inner + b"end", seq=1)[0]
-    dec = C.StreamDecoder()
-
-    assert dec.feed(outer[:-3]) == []
-    msgs = dec.feed(outer[-3:])
-
-    assert [msg.data for msg in msgs] == [b"start" + inner + b"end"]
-
-
-@pytest.mark.asyncio
-async def test_background_reader_recovers_after_idle():
-    dev = LoRaDevice("unused")
-    reader = asyncio.StreamReader()
-    dev._reader = reader
-    dev._decoder = C.StreamDecoder(partial_timeout=0.01)
-    frame = C.encode_raw(random.Random(9).randbytes(4000), seq=1)[0]
-    next_frame = C.encode_json({"ok": True}, seq=2)[0]
-    reader.feed_data(frame[:100] + next_frame)
-    task = asyncio.create_task(dev._read_loop())
-
-    try:
-        msg = await asyncio.wait_for(dev.queue.get(), timeout=1.5)
-        assert msg.data == {"ok": True}
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-
-@pytest.mark.asyncio
-async def test_background_reader_recovers_complete_frame_at_eof():
-    dev = LoRaDevice("unused")
-    reader = asyncio.StreamReader()
-    dev._reader = reader
-    truncated = C.encode_raw(random.Random(9).randbytes(4000), seq=1)[0][:100]
-    complete = C.encode_raw(b"ok", seq=2)[0]
-    reader.feed_data(truncated + complete)
-    reader.feed_eof()
-
-    await dev._read_loop()
-
-    assert dev.queue.get_nowait().data == b"ok"
-    assert dev.queue.empty()
-
-
-def test_decoder_reassembles_fragments():
-    payload = b"x" * 300
-    seq = 17
-    count = 2
-    msg_crc = C.crc32(payload) & 0xFFFFFFFF
-    verflags = (C.VERSION << 4) | C.FLAG_RAW
-    frames = []
-    for idx, start in enumerate((0, 223)):
-        chunk = payload[start : start + 223]
-        frame = bytearray(C.HEADER_LEN + len(chunk))
-        C._pack_header(frame, verflags, seq, len(payload), idx, count, len(chunk), msg_crc)
-        frame[C.HEADER_LEN :] = chunk
-        frames.append(bytes(frame))
-
-    msgs = C.StreamDecoder().feed(b"".join(frames))
-
-    assert len(msgs) == 1 and msgs[0].data == payload
-
-
-def test_partial_timeout_resets_when_fragments_arrive():
-    data = random.Random(5).randbytes(700)
-    frames = C.encode_raw(data, seq=17)
-    dec = C.StreamDecoder(partial_timeout=30)
-    out = []
-
-    for frame in frames:
-        if 17 in dec._partials:
-            dec._partials[17].t0 -= 20
-        out.extend(dec.feed(frame))
-
-    assert len(out) == 1 and out[0].data == data
-
-
-def test_decoder_rejects_mixed_fragment_flags():
-    frames = C.encode_raw(b'{"x":1}', seq=4, mtu=21, compress_level=0)
-    mixed = [bytearray(frame) for frame in frames]
-    h = C._unpack_header(mixed[-1])
-    assert h is not None
-    _, seq, total, idx, count, fl, msg_crc = h
-    C._pack_header(mixed[-1], C.VERSION << 4, seq, total, idx, count, fl, msg_crc)
-
-    with pytest.raises(ValueError, match="fragment set mismatch"):
-        C.decode_fragments(mixed)
-    assert C.StreamDecoder().feed(b"".join(mixed)) == []
-
-
-def test_stream_send_batches_below_documented_cache(monkeypatch):
-    frames = C.encode_raw(random.Random(7).randbytes(2500), seq=1)
-    dev = LoRaDevice("unused", tx_chunk_size=RADIO_CACHE_BYTES)
-    writes = []
-    waits = []
-
-    async def capture(data):
-        writes.append(data)
-
-    async def capture_wait(seconds):
-        waits.append(seconds)
-
-    monkeypatch.setattr(dev, "_write", capture)
-    monkeypatch.setattr(asyncio, "sleep", capture_wait)
-
-    written = asyncio.run(dev._send_frames(frames, None, None, pace=True))
-
-    assert written == sum(map(len, frames))
-    assert writes == frames
-    assert all(len(chunk) <= MAX_AIR_SINGLE for chunk in writes)
-    assert len(waits) == len(writes)
-    assert all(wait > 0 for wait in waits)
-
-
-def test_packet_mode_uses_one_bounded_batch(monkeypatch):
-    raw = random.Random(8).randbytes(220)
-    expected_frame = C.encode_raw(raw, seq=1)[0]
-    dev = LoRaDevice("unused", config=LoraConfig(mode=OperationMode.PACKET), tx_chunk_size=960)
-    writes = []
-    waits = []
-
-    async def capture(data):
-        writes.append(data)
-
-    async def capture_wait(seconds):
-        waits.append(seconds)
-
-    monkeypatch.setattr(dev, "_write", capture)
-    monkeypatch.setattr(asyncio, "sleep", capture_wait)
-
-    written = asyncio.run(dev.send_raw(raw, dest_addr=5, dest_channel=18))
-    prefix = C.packet_prefix(5, 18)
-    expected = prefix + expected_frame
-
-    assert written == len(expected)
-    assert writes == [expected]
-    assert len(writes[0]) == MAX_AIR_SINGLE
-    assert len(waits) == 1 and waits[0] > 0
-
-
-def test_packet_mode_rejects_multi_packet_messages():
-    dev = LoRaDevice("unused", config=LoraConfig(mode=OperationMode.PACKET))
-    raw = random.Random(8).randbytes(221)
-
-    with pytest.raises(ValueError, match="one serial batch and RF packet"):
-        asyncio.run(dev.send_raw(raw, dest_addr=5, dest_channel=18))
-    with pytest.raises(ValueError, match="require pacing"):
-        asyncio.run(dev.send_raw(b"short", dest_addr=5, dest_channel=18, pace=False))
-
-
 def test_packet_mode_requires_destination_for_raw_data():
     dev = LoRaDevice("unused", config=LoraConfig(mode=OperationMode.PACKET))
 
     with pytest.raises(ValueError, match="dest_addr"):
         asyncio.run(dev.send_raw(b"data"))
-
-
-def test_rssi_mode_rejects_multi_packet_messages():
-    dev = LoRaDevice("unused", config=LoraConfig(rssi=True))
-    raw = random.Random(8).randbytes(300)
-
-    with pytest.raises(ValueError, match="RSSI mode"):
-        asyncio.run(dev.send_raw(raw))
-    assert dev._decoder.max_room == MAX_AIR_SINGLE - C.HEADER_LEN
-    with pytest.raises(ValueError, match="RSSI mode"):
-        asyncio.run(LoRaDevice("unused", config=LoraConfig(rssi=True), tx_chunk_size=100).send_raw(raw[:100]))
-
-
-def test_tx_chunk_size_cannot_exceed_radio_cache():
-    with pytest.raises(ValueError, match="tx_chunk_size"):
-        LoRaDevice("unused", tx_chunk_size=RADIO_CACHE_BYTES + 1)
-    with pytest.raises(ValueError, match="tx_chunk_size"):
-        LoRaDevice("unused", tx_chunk_size=C.HEADER_LEN)
-    with pytest.raises(ValueError, match="tx_chunk_size"):
-        LoRaDevice("unused", config=LoraConfig(mode=OperationMode.PACKET), tx_chunk_size=20)
-    with pytest.raises(ValueError, match="serial_baud"):
-        LoRaDevice("unused", serial_baud=12345)
-
-
-def test_device_keeps_positional_mtu_argument(monkeypatch):
-    dev = LoRaDevice("unused", None, None, 200)
-    writes = []
-
-    async def capture(data):
-        writes.append(data)
-
-    monkeypatch.setattr(dev, "_write", capture)
-    asyncio.run(dev.send_raw(random.Random(4).randbytes(300), pace=False))
-
-    assert len(writes) > 1
-    assert all(len(frame) <= 200 for frame in writes)
-    assert dev._decoder.max_room == MAX_AIR_SINGLE - C.HEADER_LEN
-
-
-def test_packet_mode_requires_space_for_prefix_and_payload():
-    with pytest.raises(ValueError, match="mtu"):
-        LoRaDevice("unused", config=LoraConfig(mode=OperationMode.PACKET), mtu=20)
-    dev = LoRaDevice("unused", mtu=18)
-    with pytest.raises(ValueError, match="at least 21"):
-        asyncio.run(dev.apply_config(LoraConfig(mode=OperationMode.PACKET)))
-
-
-def test_batch_pacing_covers_airtime_serial_rate_and_lbt():
-    cfg = LoraConfig(sf=12, lbt=True)
-    dev = LoRaDevice("unused", config=cfg)
-    expected = 4 * (cfg.estimate_airtime_ms(MAX_AIR_SINGLE) + 50 + 2000)
-
-    assert dev._estimate_batch_airtime_ms(RADIO_CACHE_BYTES) == pytest.approx(expected)
-
-    slow_serial = LoRaDevice("unused", serial_baud=1200)
-    assert slow_serial._estimate_batch_airtime_ms(RADIO_CACHE_BYTES) >= 8000
 
 
 @pytest.mark.asyncio
@@ -931,22 +582,6 @@ async def test_at_session_waits_for_paced_send(monkeypatch):
     assert not dev._io_lock.locked()
 
 
-def test_codec_crc_detects_corruption():
-    frags = C.encode_json({"a": 1}, seq=3)
-    bad = bytearray(frags[0])
-    bad[-1] ^= 0xFF
-    with pytest.raises(ValueError):
-        C.decode_fragments([bytes(bad)])
-
-
-def test_codec_merged_reads_and_garbage_resync():
-    a = C.encode_json({"n": 1}, seq=10)[0]
-    b = C.encode_json({"n": 2}, seq=11)[0]
-    dec = C.StreamDecoder()
-    msgs = dec.feed(b"\x00\xffgarbage" + a + b)
-    assert [m.data["n"] for m in msgs] == [1, 2]
-
-
 def test_packet_prefix_helpers():
     p = C.packet_prefix(0xFFFE, 0x12)
     assert p == bytes([0xFF, 0xFE, 0x12])
@@ -954,28 +589,209 @@ def test_packet_prefix_helpers():
     assert (addr, ch, body) == (0xFFFE, 0x12, b"\xaa")
 
 
-def test_rssi_trailer():
-    frags = C.encode_json({"t": 1}, seq=5)
-    dec = C.StreamDecoder(rssi_trailer=1)
-    msgs = dec.feed(frags[0] + bytes([0xC8]))
-    assert len(msgs) == 1 and msgs[0].meta.rssi == 0xC8
-
-
-def test_raw_bytes_roundtrip():
-    frags = C.encode_raw(b"\x00\x01\x02hello", seq=9)
-    msg = C.decode_fragments(frags)
-    assert msg.data == b"\x00\x01\x02hello" and msg.meta.raw is True
-
-
 def test_relay_addr_helper():
     assert LoraConfig.relay_addr(0x03, 0x04) == 0x0304
 
 
-def test_fits_one_frame_matches_fragment_count():
-    from waveshare_lora import fits_one_frame
-    assert fits_one_frame({"a": 1})
-    big = [str(n) * 3 for n in range(400)]
-    assert not fits_one_frame(big)
-    assert len(C.encode_json(big, 0)) > 1
-    too_many_fragments = random.Random(1).randbytes(60000).hex()
-    assert not fits_one_frame(too_many_fragments)
+# -- codec: one frame per RF packet ------------------------------------------
+
+
+def test_codec_roundtrip_small():
+    obj = {"temp": 21.5, "id": 7}
+    frame = C.encode_json(obj, seq=1)
+    assert len(frame) < C.MAX_FRAME
+    msg = C.decode_frame(frame)
+    assert msg.data == obj
+    assert msg.meta.seq == 1 and msg.meta.size == len(frame)
+
+
+def test_wire_header_layout():
+    frame = C.encode_raw(b"x", seq=0x1234, compress_level=0)
+    assert C.HEADER_LEN == 10
+    assert frame[:6] == bytes.fromhex("4c 4f 22 12 34 01")
+    assert int.from_bytes(frame[6:10], "big") == C.crc32(frame[2:6] + b"x")
+    assert frame[C.HEADER_LEN:] == b"x"
+    assert C.decode_frame(frame).data == b"x"
+
+
+def test_codec_compression_uses_raw_deflate():
+    obj = {"sensor": "bme280", "readings": [21.5] * 30, "loc": "greenhouse-1"}
+    plain = len(json.dumps(obj, separators=(",", ":")).encode())
+    frame = C.encode_json(obj, seq=2)
+    assert len(frame) - C.HEADER_LEN < plain
+    assert frame[2] & C.FLAG_COMPRESSED
+    assert frame[C.HEADER_LEN:] == C._deflate(json.dumps(obj, separators=(",", ":")).encode(), 9)
+    assert C.decode_frame(frame).data == obj
+
+
+def test_oversized_messages_are_rejected_not_split():
+    big = random.Random(1234).randbytes(400).hex()
+    with pytest.raises(C.MessageTooLarge):
+        C.encode_json(big, seq=1)
+    assert not C.fits_json(big)
+    assert C.fits_json({"a": 1})
+    exact = random.Random(2).randbytes(C.MAX_PAYLOAD)
+    assert len(C.encode_raw(exact, seq=1)) == C.MAX_FRAME
+    with pytest.raises(C.MessageTooLarge):
+        C.encode_raw(exact + b"!", seq=1)
+    assert len(C.encode_raw(exact[:90], seq=1, max_frame=100)) == 100
+    with pytest.raises(ValueError, match="max_frame"):
+        C.encode_raw(b"x", seq=1, max_frame=C.MAX_FRAME + 1)
+
+
+def test_decode_frame_rejects_damage_and_extra_bytes():
+    frame = C.encode_json({"a": 1}, seq=3)
+    bad = bytearray(frame)
+    bad[-1] ^= 0xFF
+    with pytest.raises(ValueError, match="CRC"):
+        C.decode_frame(bytes(bad))
+    with pytest.raises(ValueError, match="length"):
+        C.decode_frame(frame + b"extra")
+    reserved = bytearray(frame)
+    reserved[2] |= 0x04
+    with pytest.raises(ValueError, match="header"):
+        C.decode_frame(bytes(reserved))
+
+
+def test_decoder_handles_split_and_merged_reads():
+    frames = [C.encode_json({"n": n}, seq=n) for n in range(5)]
+    stream = b"\x00\xffgarbage" + b"".join(frames)
+    dec = C.StreamDecoder()
+    out = []
+    for i in range(0, len(stream), 7):
+        out += dec.feed(stream[i : i + 7])
+    assert [m.data["n"] for m in out] == list(range(5))
+
+
+def test_decoder_resyncs_after_corrupt_frame():
+    broken = bytearray(C.encode_raw(b"x" * 200, seq=1, compress_level=0))
+    broken[-1] ^= 0xFF
+    good = C.encode_json({"ok": True}, seq=2)
+    assert [m.data for m in C.StreamDecoder().feed(bytes(broken) + good)] == [{"ok": True}]
+
+
+def test_decoder_does_not_wait_on_a_truncated_frame_once_a_later_one_arrives():
+    truncated = C.encode_raw(random.Random(9).randbytes(200), seq=1)[:40]
+    dec = C.StreamDecoder()
+    assert dec.feed(truncated) == []
+    out = dec.feed(C.encode_json({"ok": True}, seq=2))
+    assert [m.data for m in out] == [{"ok": True}]
+
+
+def test_decoder_skips_a_false_magic_claiming_a_long_payload():
+    fake = C.MAGIC_BYTES + bytes([C.VERSION << 4, 0, 1, 200, 0, 0, 0, 0])
+    good = C.encode_json({"ok": True}, seq=2)
+    assert [m.data for m in C.StreamDecoder().feed(fake + good)] == [{"ok": True}]
+
+
+def test_decoder_final_discards_incomplete_frame():
+    complete = C.encode_raw(b"ok", seq=2)
+    truncated = C.encode_raw(random.Random(3).randbytes(200), seq=3)[:50]
+    dec = C.StreamDecoder()
+    assert [m.data for m in dec.feed(complete + truncated)] == [b"ok"]
+    assert dec.feed(b"", final=True) == []
+    assert not dec._buf
+
+
+def test_rssi_trailer_follows_each_frame():
+    a = C.encode_json({"t": 1}, seq=5)
+    b = C.encode_json({"t": 2}, seq=6)
+    dec = C.StreamDecoder(rssi_trailer=1)
+    msgs = dec.feed(a + bytes([0xC8]) + b)
+    assert [(m.data, m.meta.rssi) for m in msgs] == [({"t": 1}, 0xC8)]
+    msgs = dec.feed(bytes([0x90]))
+    assert [(m.data, m.meta.rssi) for m in msgs] == [({"t": 2}, 0x90)]
+
+
+def test_raw_bytes_roundtrip():
+    msg = C.decode_frame(C.encode_raw(b"\x00\x01\x02hello", seq=9))
+    assert msg.data == b"\x00\x01\x02hello" and msg.meta.raw is True
+
+
+def test_decompressed_size_is_limited():
+    bomb = C._deflate(b"A" * (C.MAX_DECODED + 1), 9)
+    assert len(bomb) <= C.MAX_PAYLOAD
+    verflags = (C.VERSION << 4) | C.FLAG_COMPRESSED | C.FLAG_RAW
+    checked = C.struct.pack("!BHB", verflags, 1, len(bomb)) + bomb
+    frame = C._HEADER.pack(C.MAGIC_BYTES, verflags, 1, len(bomb), C.crc32(checked)) + bomb
+    with pytest.raises(ValueError, match="invalid payload"):
+        C.decode_frame(frame)
+
+
+# -- device: one write and one pacing wait per message -----------------------
+
+
+def _capture(monkeypatch, dev):
+    writes, waits = [], []
+
+    async def write(data):
+        writes.append(data)
+
+    async def wait(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr(dev, "_write", write)
+    monkeypatch.setattr(asyncio, "sleep", wait)
+    return writes, waits
+
+
+def test_send_writes_one_frame_and_paces_once(monkeypatch):
+    dev = LoRaDevice("unused")
+    writes, waits = _capture(monkeypatch, dev)
+    written = asyncio.run(dev.send_json({"n": 1}))
+    assert writes == [C.encode_json({"n": 1}, seq=1)] and written == len(writes[0])
+    assert waits == [pytest.approx(dev._estimate_send_ms(len(writes[0])) / 1000)]
+    with pytest.raises(C.MessageTooLarge):
+        asyncio.run(dev.send_raw(random.Random(1).randbytes(300)))
+    assert len(writes) == 1
+
+
+def test_packet_mode_prefix_counts_against_the_packet(monkeypatch):
+    dev = LoRaDevice("unused", config=LoraConfig(mode=OperationMode.PACKET))
+    writes, waits = _capture(monkeypatch, dev)
+    raw = random.Random(8).randbytes(C.MAX_PAYLOAD - 3)
+    written = asyncio.run(dev.send_raw(raw, dest_addr=5, dest_channel=18))
+    assert writes == [C.packet_prefix(5, 18) + C.encode_raw(raw, seq=1)]
+    assert written == MAX_AIR_SINGLE and len(waits) == 1
+    assert dev.frame_limit == MAX_AIR_SINGLE - 3
+    with pytest.raises(C.MessageTooLarge):
+        asyncio.run(dev.send_raw(raw + b"!", dest_addr=5, dest_channel=18))
+    with pytest.raises(ValueError, match="require pacing"):
+        asyncio.run(dev.send_raw(b"short", dest_addr=5, dest_channel=18, pace=False))
+
+
+def test_device_fits_matches_its_frame_limit():
+    dev = LoRaDevice("unused", max_frame=100)
+    assert dev.fits({"a": 1})
+    assert not dev.fits(random.Random(5).randbytes(200).hex())
+    with pytest.raises(ValueError, match="max_frame"):
+        LoRaDevice("unused", max_frame=MAX_AIR_SINGLE + 1)
+    with pytest.raises(ValueError, match="max_frame"):
+        LoRaDevice("unused", config=LoraConfig(mode=OperationMode.PACKET), max_frame=C.HEADER_LEN + 1)
+    with pytest.raises(ValueError, match="serial_baud"):
+        LoRaDevice("unused", serial_baud=12345)
+    small = LoRaDevice("unused", max_frame=C.HEADER_LEN + 1)
+    with pytest.raises(ValueError, match="at least 14"):
+        asyncio.run(small.apply_config(LoraConfig(mode=OperationMode.PACKET)))
+
+
+def test_pacing_covers_airtime_serial_rate_and_lbt():
+    cfg = LoraConfig(sf=12, lbt=True)
+    dev = LoRaDevice("unused", config=cfg)
+    assert dev._estimate_send_ms(MAX_AIR_SINGLE) == pytest.approx(cfg.estimate_airtime_ms(MAX_AIR_SINGLE) + 50 + 2000)
+    slow_serial = LoRaDevice("unused", serial_baud=1200, config=LoraConfig(sf=7))
+    assert slow_serial._estimate_send_ms(MAX_AIR_SINGLE) == pytest.approx(MAX_AIR_SINGLE * 10 * 1000 / 1200)
+
+
+@pytest.mark.asyncio
+async def test_background_reader_delivers_frames_and_skips_a_truncated_one():
+    dev = LoRaDevice("unused")
+    reader = asyncio.StreamReader()
+    dev._reader = reader
+    truncated = C.encode_raw(random.Random(9).randbytes(200), seq=1)[:60]
+    reader.feed_data(truncated + C.encode_raw(b"ok", seq=2))
+    reader.feed_eof()
+    await dev._read_loop()
+    assert dev.queue.get_nowait().data == b"ok"
+    assert dev.queue.empty()
+

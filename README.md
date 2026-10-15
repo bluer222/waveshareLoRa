@@ -30,7 +30,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Packet mode (`AT+MODE=2`) sends a destination prefix followed by one frame.
+Packet mode (`AT+MODE=2`) sends a destination prefix followed by the frame.
 The prefix and frame must fit within 240 bytes:
 
 ```python
@@ -79,48 +79,39 @@ port at the factory 115200/8N1 setting, then enters AT mode to apply the new
 configuration. The reset command's exact reply and reboot timing need a
 hardware check on the target firmware.
 
-## Wire efficiency (codec)
+## One message, one packet (codec)
 
-`codec.py` packs each application message with a precompiled `struct`:
+Every message is one frame, and every frame is one RF packet of at most 240
+bytes, the module's single-packet limit. A lost packet loses only its own
+message. There is no fragmentation: `send_json` raises `MessageTooLarge` for a
+message that does not fit, and callers split independent data into several
+messages. `LoRaDevice.fits(obj)` (or `fits_json(obj, max_frame)`) checks first.
 
 ```
-MAGIC 2B | VERFLAGS 1B | SEQ 2B | TOTAL 2B | IDX 1B | COUNT 1B | FRAG_LEN 2B | HDR_CRC 2B | CRC32 4B | payload
+MAGIC 2B | VERFLAGS 1B | SEQ 2B | LEN 1B | CRC32 4B | payload (≤ 230 B)
 ```
 
 * JSON dumped compactly (`orjson` when installed, else `separators=(",",":")`).
-* `zlib` (C) compression applied only when it shrinks; 1 flag bit records it.
-  The uncompressed message limit is 1 MiB on both encoding and decoding.
-* The encoder compresses each message once, then divides it into application
-  fragments no larger than 240 bytes including each 17-byte header.
-  `StreamDecoder` reassembles them across arbitrary serial reads. A truncated
-  fragment can delay later messages until its declared length is filled or
-  30 seconds pass without input; it cannot claim thousands of later bytes.
-  On EOF, the decoder scans past a truncated fragment to recover complete
-  frames. A complete frame deliberately embedded inside a truncated raw
-  payload is indistinguishable from a later frame and may also be delivered.
-* The sender writes one fragment at a time and waits for a rough airtime
-  estimate. Each write is at most 240 bytes, or less when `tx_chunk_size` is
-  smaller. Pacing is not a transmit-complete signal.
-* Packet mode sends one prefix and one frame in a single write. The library
-  rejects frames that exceed 237 bytes after the 3-byte prefix and requires
-  pacing between sends. Waveshare documents what the first three bytes of a
-  sent data stream mean, but not the UART idle time that separates streams.
-  Consecutive packet-mode sends still need a hardware test to confirm that
-  the dongle treats them as separate streams. To check this, alternate small
-  and 240-byte sends to two receiver addresses and verify both the destination
-  and decoded payload on each receiver.
-* When `AT+RSSI=1`, the library rejects outgoing messages needing more than
-  one fragment. Every peer must observe that limit.
-  RSSI bytes follow the dongle's RF packets, not application messages. This
-  mode also assumes the dongle emits one application frame per RF packet;
-  verify that on hardware, or leave RSSI disabled.
+* Raw DEFLATE applied only when it shrinks the payload; 1 flag bit records it.
+  The frame CRC32 covers the header fields and payload, so zlib's own wrapper
+  and checksum are dropped. Decoded payloads are limited to 64 KiB.
+* `SEQ` increments per message, so a receiver can count lost packets from gaps.
+* `StreamDecoder` finds frames across arbitrary serial reads by scanning for
+  the magic and checking the CRC. A damaged header can claim up to 230 bytes;
+  the decoder stops waiting for it as soon as a later complete frame arrives.
+* The sender writes one frame and waits for a rough airtime estimate plus
+  50 ms (and 2 s with LBT). Pacing is not a transmit-complete signal.
+* Packet mode puts a 3-byte prefix before the frame, leaving 237 bytes for it.
+  Waveshare documents what the first three bytes of a sent data stream mean,
+  but not the UART idle time that separates streams. Consecutive packet-mode
+  sends still need a hardware test to confirm that the dongle treats them as
+  separate streams. To check this, alternate small and 240-byte sends to two
+  receiver addresses and verify both the destination and decoded payload on
+  each receiver.
+* With `AT+RSSI=1`, the dongle appends an RSSI byte after each RF packet;
+  since a frame is one packet, each frame carries its own RSSI.
 
-Typical sensor JSON compresses 50–80 %; each fragment has a 17-byte header.
-
-A multi-fragment message is lost if any fragment is lost. When the data has
-no internal relations, pack it into messages that pass
-`LoRaDevice.fits_one_packet(obj)` (or `fits_one_frame(obj, mtu)`), so each RF
-packet decodes on its own.
+Typical sensor JSON compresses 50–80 %; each frame has a 10-byte header.
 
 ## Layout
 
@@ -134,8 +125,8 @@ tests/test_lora.py                               # hardware-free, pytest-asyncio
 
 * Default pairing: stream mode, 115200 8N1, CH18 (HF 868 MHz) / CH23 (LF 433 MHz).
 * Single RF packet ≤ 240 B; the dongle auto-packetizes larger streams and has
-  a fixed 960-byte cache. Library writes stay within the RF packet limit, but
-  the vendor does not document RF flush timing.
+  a fixed 960-byte cache. Each library write is one frame within the RF packet
+  limit, but the vendor does not document RF flush timing.
 * Relay mode (`AT+MODE=3`) forwards only — no serial output. Relay ADDR =
   `first_netid << 8 | second_netid` (`LoraConfig.relay_addr`).
 * `65535` (`0xFFFF`) is the broadcast/listen-all address.
