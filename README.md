@@ -1,144 +1,33 @@
-# waveshare-lora — async JSON over Waveshare USB-TO-LoRa-xF (SX1262)
+Note: This repository is primarily AI-generated code.
 
-Async Python library for sending/receiving JSON over the
-[Waveshare USB-TO-LoRa-xF](https://www.waveshare.com/usb-to-lora.htm)
-([wiki](https://www.waveshare.com/wiki/USB-TO-LoRa-xF), SX1262, 410–490 / 850–930 MHz).
-Full AT parameter coverage, `asyncio`-native serial, and a compact
-`struct.pack` + `zlib` message codec.
+# waveshareLoRa
 
-## Install
+An async Python library for sending and receiving JSON over Waveshare
+USB-TO-LoRa-xF radios with SX1262 modules. It includes AT configuration,
+message framing, compression, and examples for two paired radios.
 
-```bash
-pip install -e ".[fast]"   # fast: orjson for C-speed JSON
-```
+## Brief usage
 
-Needs two units on the same channel/band to form a link (point-to-point out of the box).
-
-## Quick start (stream mode, transparent)
-
-```python
-import asyncio
-from waveshare_lora import LoRaDevice, LoraConfig
-
-async def main():
-    cfg = LoraConfig(txch=18, rxch=18, band="HF")  # 868 MHz
-    async with LoRaDevice("/dev/ttyUSB0", config=cfg) as dev:
-        await dev.send_json({"temp": 21.5, "id": 7})
-        data, meta = await dev.recv_json(timeout=10.0)
-        print(data, meta)
-
-asyncio.run(main())
-```
-
-Packet mode (`AT+MODE=2`) sends a destination prefix followed by one frame.
-The prefix and frame must fit within 240 bytes:
-
-```python
-cfg = LoraConfig(mode=2, addr=0x0001, txch=18, rxch=18)
-async with LoRaDevice("/dev/ttyUSB0", config=cfg) as dev:
-    await dev.apply_config(cfg)  # set AT+MODE=2 on the radio
-    await dev.send_json({"cmd": "on"}, dest_addr=0x0002, dest_channel=18)
-```
-
-Configure every radio parameter at once:
-
-```python
-await dev.apply_config(LoraConfig(sf=9, pwr=22, key=1234, lbt=True))
-live = await dev.read_config()   # AT+ALLP? round-trip
-```
-
-See `examples/configure.py` and `examples/send_receive.py`.
-
-## All parameters (`LoraConfig`)
-
-| Field | AT | Range | Notes |
-|---|---|---|---|
-| `sf` | `AT+SF` | 7–12 | spreading factor |
-| `bw` | `AT+BW` | 0/1/2 = 125/250/500 kHz | `AllP` uses kHz value |
-| `cr` | `AT+CR` | 1–4 = 4/5…4/8 | error-correction strength |
-| `pwr` | `AT+PWR` | 10–22 dBm | TX power |
-| `netid` | `AT+NETID` | 0–65535 | relay addressing domain |
-| `lbt` | `AT+LBT` | 0/1 | listen-before-talk |
-| `mode` | `AT+MODE` | 1 stream / 2 packet / 3 relay | |
-| `txch`/`rxch` | `AT+TXCH`/`AT+RXCH` | 0–80 | freq = 410+CH (LF) or 850+CH (HF) |
-| `rssi` | `AT+RSSI` | 0/1 | trailer per dongle output packet; library sends are limited to one RF packet when enabled |
-| `addr` | `AT+ADDR` | 0–65535 | 65535 = broadcast listen |
-| `port` | `AT+PORT` | 1 RS422 / 2 RS485 / 3 RS232 | kept for AllP compat on USB units |
-| `baud` | `AT+BAUD` | 1200…115200 | host port re-opens on change |
-| `comm` | `AT+COMM` | `"8N1"`-style | `[89][NOE][012]` |
-| `key` | `AT+KEY` | 0–65535 | 0 = AES off |
-| `band` | — | HF/LF | host-side frequency base (not stored) |
-
-Plus `+++` / `AT+EXIT` / `ATE` / `AT+VER` / `AT+HELP` / `AT+ALLP?` /
-`AT+AllP=…` / `AT+RESTORE=1`. `apply_config()` writes a single `AT+AllP`
-(15 fields) by default, exits (module reboots ≈3 s), and re-opens the host
-port if the baud or serial framing changed. `+++` is sent in one write — char-by-char entry
-is ignored by firmware.
-With `restore_first=True`, the library waits for the reset, re-opens the host
-port at the factory 115200/8N1 setting, then enters AT mode to apply the new
-configuration. The reset command's exact reply and reboot timing need a
-hardware check on the target firmware.
-
-## Wire efficiency (codec)
-
-`codec.py` packs each application message with a precompiled `struct`:
-
-```
-MAGIC 2B | VERFLAGS 1B | SEQ 2B | TOTAL 2B | IDX 1B | COUNT 1B | FRAG_LEN 2B | HDR_CRC 2B | CRC32 4B | payload
-```
-
-* JSON dumped compactly (`orjson` when installed, else `separators=(",",":")`).
-* `zlib` (C) compression applied only when it shrinks; 1 flag bit records it.
-  The uncompressed message limit is 1 MiB on both encoding and decoding.
-* The encoder compresses each message once, then divides it into application
-  fragments no larger than 240 bytes including each 17-byte header.
-  `StreamDecoder` reassembles them across arbitrary serial reads. A truncated
-  fragment can delay later messages until its declared length is filled or
-  30 seconds pass without input; it cannot claim thousands of later bytes.
-  On EOF, the decoder scans past a truncated fragment to recover complete
-  frames. A complete frame deliberately embedded inside a truncated raw
-  payload is indistinguishable from a later frame and may also be delivered.
-* The sender writes one fragment at a time and waits for a rough airtime
-  estimate. Each write is at most 240 bytes, or less when `tx_chunk_size` is
-  smaller. Pacing is not a transmit-complete signal.
-* Packet mode sends one prefix and one frame in a single write. The library
-  rejects frames that exceed 237 bytes after the 3-byte prefix and requires
-  pacing between sends. Waveshare documents what the first three bytes of a
-  sent data stream mean, but not the UART idle time that separates streams.
-  Consecutive packet-mode sends still need a hardware test to confirm that
-  the dongle treats them as separate streams. To check this, alternate small
-  and 240-byte sends to two receiver addresses and verify both the destination
-  and decoded payload on each receiver.
-* When `AT+RSSI=1`, the library rejects outgoing messages needing more than
-  one fragment. Every peer must observe that limit.
-  RSSI bytes follow the dongle's RF packets, not application messages. This
-  mode also assumes the dongle emits one application frame per RF packet;
-  verify that on hardware, or leave RSSI disabled.
-
-Typical sensor JSON compresses 50–80 %; each fragment has a 17-byte header.
-
-## Layout
-
-```
-src/waveshare_lora/{config,at,codec,device}.py  # library
-examples/{send_receive,configure}.py
-tests/test_lora.py                               # hardware-free, pytest-asyncio
-```
-
-## Hardware notes
-
-* Default pairing: stream mode, 115200 8N1, CH18 (HF 868 MHz) / CH23 (LF 433 MHz).
-* Single RF packet ≤ 240 B; the dongle auto-packetizes larger streams and has
-  a fixed 960-byte cache. Library writes stay within the RF packet limit, but
-  the vendor does not document RF flush timing.
-* Relay mode (`AT+MODE=3`) forwards only — no serial output. Relay ADDR =
-  `first_netid << 8 | second_netid` (`LoraConfig.relay_addr`).
-* `65535` (`0xFFFF`) is the broadcast/listen-all address.
-* AES: same nonzero `key` on both ends or no link.
-
-## Test
+Requires Python 3.10+ and two radios configured for the same band, channel,
+and radio settings. Clone this repository, then run:
 
 ```bash
-pip install -e ".[test]"
-python -m pytest -q
+python -m pip install -e .
+# Configure each radio, using its serial port and a locally permitted channel.
+python examples/configure.py --port /dev/ttyUSB0 --channel 65 --band HF --mode 1
+python examples/send_receive.py --port /dev/ttyUSB0 --channel 65 --band HF
 ```
+
+Run the send/receive example on each computer with its radio's port.
+HF channel 65 is 915 MHz. Choose settings permitted in your location.
+Passing a `LoraConfig` to `LoRaDevice` sets host expectations; call
+`apply_config()` or use the configure script to write settings to the radio.
+
+## More documentation
+
+- [Usage, Python examples, AT parameters, wire format, hardware notes, and tests](docs/USAGE.md)
+
+## License
+
+GNU Affero General Public License v3.0 only, `AGPL-3.0-only`.
+See [LICENCE](LICENCE) for the full text.

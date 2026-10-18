@@ -44,7 +44,7 @@ def test_documented_parameter_boundaries():
         band="LF",
     )
 
-    assert cfg.to_allp() == 'AT+AllP=12,500,4,10,65535,1,3,80,0,1,65535,1,14400,"9E2",65535'
+    assert cfg.to_allp() == 'AT+AllP=12,2,4,10,65535,1,3,80,0,1,65535,1,"9E2",14400,65535'
     assert (cfg.tx_freq_mhz(), cfg.rx_freq_mhz()) == (490, 410)
 
 
@@ -83,7 +83,7 @@ def test_at_commands_cover_all_params():
     ):
         assert f"AT+{p}=" in joined
     allp = LoraConfig().to_allp()
-    assert allp.startswith("AT+AllP=7,125,")  # BW as kHz value, not index
+    assert allp.startswith("AT+AllP=7,0,")  # BW as index (AT+BW spelling), not kHz
     assert '"8N1"' in allp
 
 
@@ -93,6 +93,34 @@ def test_allp_roundtrip():
     assert back.sf == 9 and back.txch == 20 and back.addr == 5
     assert back.key == 1234 and back.rssi is True
     assert int(back.bw) == 0 and back.bw_khz == 125
+
+
+def test_allp_parses_hardware_and_wiki_spellings():
+    hw = '+ALLP=7,0,1,22,0,0,1,18,18,0,0,1,"8N1",115200,0'  # FW Ver1.2 capture
+    cfg = LoraConfig.from_allp(hw)
+    assert int(cfg.bw) == 0 and cfg.bw_khz == 125
+    assert (cfg.comm, cfg.baud, cfg.port) == ("8N1", 115200, 1)
+    assert cfg.to_allp() == f"AT+AllP={hw.split('=',1)[1]}"
+
+    wiki = 'AT+AllP=7,125,1,22,0,0,1,18,18,0,0,3,115200,"8N1",0'  # wiki order/units
+    wcfg = LoraConfig.from_allp(wiki)
+    assert int(wcfg.bw) == 0 and (wcfg.comm, wcfg.baud, wcfg.port) == ("8N1", 115200, 3)
+
+
+@pytest.mark.parametrize("bw,index", [("0", 0), ("1", 1), ("2", 2), ("250", 1), ("500", 2)])
+def test_allp_parses_query_echo_and_trailing_ok(bw, index):
+    reply = f'AT+ALLP?\r\n+allp=7,{bw},1,22,0,0,1,65,65,0,0,3,"8N1",115200,0\r\nOK\r\n'
+
+    cfg = LoraConfig.from_allp(reply)
+
+    assert int(cfg.bw) == index
+    assert (cfg.txch, cfg.rxch, cfg.comm, cfg.baud) == (65, 65, "8N1", 115200)
+
+
+@pytest.mark.parametrize("tail", ['"8N1","8N1"', "115200,9600"])
+def test_allp_rejects_ambiguous_serial_tail(tail):
+    with pytest.raises(ValueError, match="AllP tail"):
+        LoraConfig.from_allp(f"7,0,1,22,0,0,1,65,65,0,0,3,{tail},0")
 
 
 def test_bw_khz_accepted():
@@ -502,6 +530,81 @@ async def test_apply_config_reopens_with_new_serial_framing(monkeypatch, baud):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reply", [b"+++\r\n", b"ERROR\r\n", b"OK\r\n"])
+async def test_at_entry_confirms_version_after_echo_or_error(monkeypatch, reply):
+    dev = LoRaDevice("unused")
+    commands = []
+
+    async def at_command(cmd, **kwargs):
+        commands.append(cmd)
+        if cmd == "+++":
+            dev._at_buf = bytearray(reply)
+            assert dev._looks_like_at_reply()
+            if not AT.parse_reply(reply).ok:
+                raise RuntimeError("entry has no OK")
+        return AT.AtReply(raw="OK", ok=True)
+
+    monkeypatch.setattr(dev, "_at", at_command)
+
+    await dev.enter_at_mode()
+
+    assert commands == ["+++", AT.AT_VER]
+    assert dev._at_mode and dev._io_owner is asyncio.current_task()
+    dev._release_io()
+
+
+@pytest.mark.asyncio
+async def test_at_entry_retries_version_while_radio_reboots(monkeypatch):
+    dev = LoRaDevice("unused")
+    commands = []
+    waits = []
+
+    async def at_command(cmd, **kwargs):
+        commands.append(cmd)
+        if cmd == "+++":
+            raise RuntimeError("entry echo has no OK")
+        if commands.count(AT.AT_VER) < 3:
+            raise TimeoutError("radio rebooting")
+        return AT.AtReply(raw="OK", ok=True)
+
+    async def no_wait(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr(dev, "_at", at_command)
+    monkeypatch.setattr(asyncio, "sleep", no_wait)
+
+    await dev.enter_at_mode()
+
+    assert commands == ["+++", AT.AT_VER] * 3
+    assert waits == [1.0, 1.0]
+    assert dev._at_mode and dev._io_lock.locked()
+    dev._release_io()
+
+
+@pytest.mark.asyncio
+async def test_failed_at_entry_releases_only_its_io_lock(monkeypatch):
+    dev = LoRaDevice("unused")
+
+    async def at_command(cmd, **kwargs):
+        raise OSError("radio disconnected")
+
+    async def no_wait(seconds):
+        pass
+
+    monkeypatch.setattr(dev, "_at", at_command)
+    monkeypatch.setattr(asyncio, "sleep", no_wait)
+
+    async with dev._io_guard():
+        with pytest.raises(OSError, match="radio disconnected"):
+            await dev.enter_at_mode()
+        assert not dev._at_mode
+        assert dev._io_owner is asyncio.current_task()
+        assert dev._io_depth == 1
+
+    assert not dev._io_lock.locked()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_at_entry_releases_io_lock(monkeypatch):
     dev = LoRaDevice("unused")
     started = asyncio.Event()
@@ -549,7 +652,7 @@ async def test_restore_reenters_at_mode_after_missing_reply(monkeypatch):
 
     await dev.apply_config(cfg, restore_first=True)
 
-    assert commands == ["+++", "AT+RESTORE=1", "+++", cfg.to_allp(), AT.AT_EXIT]
+    assert commands == ["+++", AT.AT_VER, "AT+RESTORE=1", "+++", AT.AT_VER, cfg.to_allp(), AT.AT_EXIT]
     assert reopened[0] == "disconnect"
     assert reopened[1][0:2] == (115200, "8N1")
     assert reopened[1][2].baud == 115200
@@ -731,7 +834,7 @@ async def test_cancelled_restore_reopens_at_factory_settings(monkeypatch):
 
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert commands == ["+++", "AT+RESTORE=1"]
+    assert commands == ["+++", AT.AT_VER, "AT+RESTORE=1"]
     assert reopened == ["disconnect", (115200, "8N1")]
     assert dev.config.baud == 115200
     assert not dev._io_lock.locked()

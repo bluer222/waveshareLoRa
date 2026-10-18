@@ -290,7 +290,9 @@ class LoRaDevice:
 
     def _looks_like_at_reply(self) -> bool:
         upper = bytes(self._at_buf).upper()
-        return any(t in upper for t in (*_AT_OK_TOKENS, b"ERROR", b"ERR"))
+        # NOTE (HW Ver1.2): '+++' from data mode is echoed with NO OK/ERROR,
+        # from AT mode it returns ERROR. Either way the echo means "heard".
+        return any(t in upper for t in (*_AT_OK_TOKENS, b"ERROR", b"ERR", b"+++"))
 
     # -- low-level write -------------------------------------------------------
     async def _write(self, data: bytes) -> None:
@@ -330,10 +332,30 @@ class LoRaDevice:
             await self._acquire_io()
         self._at_mode = True
         try:
-            await self._at("+++", timeout=timeout)
+            # HW Ver1.2: '+++' from data mode replies with a bare echo
+            # (no OK), from AT mode with ERROR. Neither parses as ok, so
+            # ignore its result and confirm AT mode with AT+VER instead.
+            # (CancelledError still propagates to the cleanup below.)
+            # Retry: the module may still be rebooting from a recent EXIT.
+            last_exc: BaseException | None = None
+            for attempt in range(3):
+                try:
+                    await self._at("+++", timeout=min(timeout, 1.0))
+                except (TimeoutError, RuntimeError, OSError) as exc:
+                    last_exc = exc
+                try:
+                    await self._at(_at.AT_VER, timeout=timeout)
+                    last_exc = None
+                    break
+                except (TimeoutError, RuntimeError, OSError) as exc:
+                    last_exc = exc
+                    await asyncio.sleep(1.0)
+            if last_exc is not None:
+                raise last_exc
         except BaseException:
             self._at_mode = False
-            self._release_io()
+            if not already_owned:
+                self._release_io()
             raise
 
     async def exit_at_mode(self) -> None:

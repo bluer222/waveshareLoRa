@@ -7,11 +7,13 @@ References:
   https://www.waveshare.com/wiki/USB-TO-LoRa-xF
   https://www.waveshare.com/wiki/SX1262-LoRa-DTU-xF
 
-AllP field order (15 fields, SF..KEY):
-  SF, BW_kHz, CR, PWR, NETID, LBT, MODE, TXCH, RXCH, RSSI, ADDR, PORT, BAUD, COMM, KEY
+AllP field order (15 fields, SF..KEY) on firmware Ver1.2 (hardware truth):
+  SF, BW_index, CR, PWR, NETID, LBT, MODE, TXCH, RXCH, RSSI, ADDR, PORT, COMM, BAUD, KEY
 
-NOTE: AT+BW uses an *index* (0=125, 1=250, 2=500) while AllP uses the
-kHz *value* (125/250/500). This class handles both.
+NOTE: the Waveshare wiki documents ``AT+AllP=7,125,...`` (BW in kHz, order
+PORT,BAUD,COMM), but Ver1.2 hardware replies ``+ALLP=7,0,...`` (BW *index*
+0=125/1=250/2=500, order PORT,COMM,BAUD). This class writes the hardware
+order and parses both spellings.
 """
 
 from __future__ import annotations
@@ -237,12 +239,16 @@ class LoraConfig:
         ]
 
     def to_allp(self) -> str:
-        """Build the bulk command with fields in the device's documented order."""
+        """Build the bulk command in the device's field order (FW Ver1.2).
+
+        BW is sent as the index (0=125/1=250/2=500, like ``AT+BW``) and the
+        tail order is ``PORT,COMM,BAUD,KEY`` to match ``AT+ALLP?`` replies.
+        """
         return (
-            f"AT+AllP={int(self.sf)},{self.bw_khz},{int(self.cr)},{int(self.pwr)},"
+            f"AT+AllP={int(self.sf)},{int(self.bw)},{int(self.cr)},{int(self.pwr)},"
             f"{int(self.netid)},{int(self.lbt)},{int(self.mode)},"
             f"{int(self.txch)},{int(self.rxch)},{int(self.rssi)},{int(self.addr)},"
-            f'{int(self.port)},{int(self.baud)},"{self.comm}",{int(self.key)}'
+            f'{int(self.port)},"{self.comm}",{int(self.baud)},{int(self.key)}'
         )
 
     @classmethod
@@ -250,25 +256,42 @@ class LoraConfig:
         """Parse ``AT+ALLP?`` reply or an AllP value list into a config.
 
         Accepts ``+AllP:7,125,1,22,...`` / ``7,125,1,22,...`` with optional quotes.
+        BW accepts index (0/1/2) or kHz (125/250/500); the tail accepts both
+        ``PORT,COMM,BAUD,KEY`` (hardware) and ``PORT,BAUD,COMM,KEY`` (wiki).
         """
         s = response.strip()
-        # strip "+AllP:" / "AllP:" prefix and OK/ERROR lines
+        # strip "+ALLP=..." / "+AllP:..." prefix and OK/ERROR/echo lines:
+        # the reply block echoes the query plus OK, so pick the data line.
         for line in s.splitlines():
             line = line.strip()
-            if "AllP" in line and ("," in line):
+            if "allp" in line.lower() and ("," in line):
                 s = line
                 break
-        s = re.sub(r"(?i)^\+?allp\s*:\s*", "", s).strip()
-        s = re.sub(r"(?i)^AT\+allp\s*=\s*", "", s).strip()
+        s = re.sub(r"(?i)^\+?(AT\+)?allp\s*[:=]\s*", "", s).strip()
         parts = [p.strip().strip('"').strip("'") for p in s.split(",")]
         if len(parts) != 15:
             raise ValueError(f"AllP needs 15 fields, got {len(parts)}: {response!r}")
-        (sf, bw_khz, cr, pwr, netid, lbt, mode, txch, rxch, rssi, addr, port, baud, comm, key) = (
+        (sf, bw_raw, cr, pwr, netid, lbt, mode, txch, rxch, rssi, addr, port, f12, f13, key) = (
             parts
         )
+        try:
+            bw_val = int(bw_raw)
+        except ValueError:
+            raise ValueError(f"AllP BW must be 0/1/2 or 125/250/500, got {bw_raw!r}")
+        if bw_val in (0, 1, 2):
+            bw = BandwidthIndex(bw_val)
+        else:
+            bw = BandwidthIndex.from_khz(bw_val)  # wiki-style kHz spelling
+        # Tail order: hardware sends PORT,COMM,BAUD; wiki documents PORT,BAUD,COMM.
+        if COMM_RE.match(f12.upper()) and f13.isdigit():
+            comm, baud_raw = f12, f13
+        elif f12.isdigit() and COMM_RE.match(f13.upper()):
+            baud_raw, comm = f12, f13
+        else:
+            raise ValueError(f"AllP tail must be PORT,COMM,BAUD or PORT,BAUD,COMM, got {f12!r},{f13!r}")
         return cls(
             sf=int(sf),
-            bw=BandwidthIndex.from_khz(int(bw_khz)),
+            bw=bw,
             cr=int(cr),
             pwr=int(pwr),
             netid=int(netid),
@@ -279,7 +302,7 @@ class LoraConfig:
             rssi=bool(int(rssi)),
             addr=int(addr),
             port=int(port),
-            baud=int(baud),
+            baud=int(baud_raw),
             comm=comm,
             key=int(key),
             band=band,
